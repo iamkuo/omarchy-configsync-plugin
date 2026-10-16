@@ -1,0 +1,989 @@
+#!/usr/bin/env python3
+"""configsync — detect app configs and sync the ones you choose.
+
+Two backends, chosen per app:
+
+  git     small configs, versioned in a git repo (default)
+  gdrive  large/personal trees, mirrored with rsync to a Google Drive folder
+
+The plugin's window and service drive this CLI; everything it prints is either
+human text or a single JSON document, so it stays scriptable on its own.
+
+State (which apps are on, and where each one goes) lives in one file:
+
+  ~/.config/omarchy/configsync.json
+
+The git backend keeps a working repo whose `home/` subtree mirrors $HOME:
+
+  ~/.local/share/omarchy-configsync/git/home/...
+
+Only config-shaped files are ever considered. Credentials, keys, sessions and
+caches are excluded on purpose (see SECRETS / SKIP_CONFIG / RISKY / EXCLUDES).
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE_FILE = HOME / ".config/omarchy/configsync.json"
+DATA_DIR = HOME / ".local/share/omarchy-configsync"
+GIT_DIR = DATA_DIR / "git"
+STORE = GIT_DIR / "home"
+GDRIVE_STORE = DATA_DIR / "gdrive"
+# Manifest of what to reinstall on a fresh machine. It lives under the synced
+# Omarchy settings path, so it travels with the rest of the config.
+MANIFEST = HOME / ".config/omarchy/configsync/software.json"
+PLUGIN_DIR = HOME / ".config/omarchy/plugins"
+
+VERSION = 1
+
+# --- Classification --------------------------------------------------------
+
+# Never detected at all: credentials, keys and session material.
+SECRETS = [
+    ".ssh", ".gnupg", ".netrc", ".authinfo", ".authinfo.gpg",
+    ".config/gh", ".config/gcloud", ".config/sops", ".config/age",
+    ".config/Bitwarden", ".config/Bitwarden CLI", ".config/1Password",
+    ".local/share/keyrings", ".config/pulse", ".aws", ".docker",
+    ".config/rustup", ".config/go", ".password-store",
+]
+
+# Top-level entries that are machine state, not user config.
+SKIP_CONFIG = {
+    "systemd", "dconf", "procps", "environment.d", "autostart",
+    "rustup", "go", "npm", "pip", "node_modules", "pycache",
+    "mimeapps.list", "user-dirs.dirs", "Trash", "gtk-2.0",
+}
+
+# Detected, but off by default and flagged: they hold sessions, tokens or
+# personal data that a fresh machine is not really "restoring".
+RISKY = {
+    "chromium": "Browser profile — cookies, sessions and saved logins live here.",
+    "google-chrome": "Browser profile — cookies, sessions and saved logins live here.",
+    "google-chrome-beta": "Browser profile — cookies, sessions and saved logins live here.",
+    "google-chrome-unstable": "Browser profile — cookies, sessions and saved logins live here.",
+    "microsoft-edge": "Browser profile — cookies, sessions and saved logins live here.",
+    "microsoft-edge-dev": "Browser profile — cookies, sessions and saved logins live here.",
+    "BraveSoftware": "Browser profile — cookies, sessions and saved logins live here.",
+    "mozilla": "Browser profile — cookies, sessions and saved logins live here.",
+    "Code": "Editor profile — extensions and globalStorage may hold access tokens.",
+    "opencode": "May hold provider API keys or credentials.",
+    "obsidian": "Vault config — may point at personal notes.",
+    "Proton": "Proton session and account data.",
+    "Bitwarden": "Password-vault client data.",
+}
+
+# Home dotfiles worth offering, with display names.
+DOTFILES = {
+    ".bashrc": "Bash rc", ".bash_profile": "Bash profile", ".profile": "POSIX profile",
+    ".zshrc": "Zsh rc", ".zprofile": "Zsh profile", ".zlogin": "Zsh login",
+    ".gitconfig": "Git config", ".gitignore_global": "Git global ignore",
+    ".tmux.conf": "tmux config", ".XCompose": "Compose keys",
+    ".inputrc": "Readline config", ".vimrc": "Vim config", ".ideavimrc": "IdeaVim config",
+    ".wgetrc": "Wget config", ".curlrc": "curl config", ".nanorc": "Nano config",
+}
+
+# Omarchy's own settings, offered as first-class groups.
+OMARCHY = [
+    {"id": "hyprland", "name": "Hyprland", "paths": ["~/.config/hypr"],
+     "exclude": []},
+    {"id": "omarchy", "name": "Omarchy settings", "paths": ["~/.config/omarchy"],
+     "exclude": ["plugins"]},
+]
+OMARCHY_IDS = {group["id"] for group in OMARCHY}
+# Config dirs that the Omarchy groups already cover; don't offer them twice.
+OMARCHY_DIRS = {Path(p).name for group in OMARCHY for p in group["paths"]}
+
+# Personal folders that are not "config" but are exactly what a fresh machine
+# wants back. They default to Google Drive, on, and are offered under a
+# `personal-` id so they never collide with an app of the same name.
+COMMON_DIRS = {
+    "Documents": "Documents", "Pictures": "Pictures", "Music": "Music",
+    "Videos": "Videos", "Desktop": "Desktop", "Downloads": "Downloads",
+    "Public": "Public", "Templates": "Templates",
+    # Developer / notes folders people commonly keep outside a dotfile.
+    "Projects": "Projects", "projects": "projects", "Code": "Code", "code": "code",
+    "Dev": "Dev", "dev": "dev", "repos": "repos", "workspace": "workspace",
+    "src": "src", "git": "git", "Notes": "Notes", "Books": "Books",
+}
+
+# rsync exclude patterns applied to every copy, both directions.
+EXCLUDES = [
+    "Cache", "GPUCache", "Code Cache", "Service Worker", "Session Storage",
+    "Local Storage", "IndexedDB", "Local State", "Singleton*", "Crashpad",
+    "blob_storage", "File System", "Sync Data", "History", "Top Sites",
+    "Visited Links", "TransportSecurity", "Network Persistent State",
+    "*.lock", "*.log", "*.tmp", "*.tmp.*", "logs", ".git", "node_modules",
+    "__pycache__", "*.pyc", "credentials", "*.credentials", ".git-credentials",
+    ".netrc", "known_hosts",
+]
+
+# Pretty names for common config dirs; anything else is titled-cased.
+PRETTY = {
+    "alacritty": "Alacritty", "btop": "btop", "fastfetch": "fastfetch",
+    "foot": "foot", "ghostty": "Ghostty", "kitty": "Kitty", "lazygit": "lazygit",
+    "nvim": "Neovim", "starship.toml": "Starship", "starship": "Starship",
+    "tmux": "tmux", "gh": "GitHub CLI", "hypr": "Hyprland", "omarchy": "Omarchy",
+    "mise": "mise", "herdr": "Herdr", "mpv": "mpv", "yay": "yay", "fcitx5": "Fcitx5",
+    "fcitx": "Fcitx", "wireplumber": "WirePlumber", "pulse": "PulseAudio",
+    "xournalpp": "Xournal++", "imv": "imv", "nautilus": "Files",
+}
+
+
+# --- small helpers ---------------------------------------------------------
+
+def expand(p) -> Path:
+    return Path(os.path.expanduser(str(p)))
+
+
+def to_tilde(p: Path) -> str:
+    s = str(p)
+    home = str(HOME)
+    return "~" + s[len(home):] if s == home or s.startswith(home + "/") else s
+
+
+def run(cmd, cwd=None, check=True, env=None):
+    proc = subprocess.run(
+        cmd, cwd=cwd, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"{' '.join(map(str, cmd))}\n{proc.stdout.strip()}")
+    return proc
+
+
+def have(binary: str) -> bool:
+    return shutil.which(binary) is not None
+
+
+def default_state() -> dict:
+    return {
+        "version": VERSION,
+        "git": {"remote": "", "branch": "main"},
+        "gdrive": {"remote": "", "delete": False},
+        "auto": {"enabled": False, "intervalMinutes": 30},
+        "apps": {},
+        "hidden": [],
+        "lastSync": {"at": "", "ok": True, "message": "never synced"},
+    }
+
+
+def load_state() -> dict:
+    state = default_state()
+    if STATE_FILE.exists():
+        try:
+            loaded = json.loads(STATE_FILE.read_text())
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        for key in ("version", "git", "gdrive", "auto", "apps", "hidden", "lastSync"):
+            if key in loaded:
+                if isinstance(state.get(key), dict) and isinstance(loaded[key], dict):
+                    state[key].update(loaded[key])
+                else:
+                    state[key] = loaded[key]
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n")
+    tmp.replace(STATE_FILE)
+
+
+# --- detection -------------------------------------------------------------
+
+def name_for(entry: str, kind: str) -> str:
+    if entry in PRETTY:
+        return PRETTY[entry]
+    if kind == "dotfile" and entry in DOTFILES:
+        return DOTFILES[entry]
+    stem = entry.lstrip(".").replace("_", "-")
+    return " ".join(w.capitalize() if w.islower() else w for w in stem.split("-"))
+
+
+def is_secret(rel: str) -> bool:
+    return any(rel == s or rel.startswith(s + "/") for s in SECRETS)
+
+
+def detect() -> dict:
+    """Walk ~/.config and the home dotfiles; return {id: candidate}."""
+    found: dict[str, dict] = {}
+
+    if (HOME / ".config").is_dir():
+        for child in sorted((HOME / ".config").iterdir()):
+            name = child.name
+            if name in SKIP_CONFIG or name in OMARCHY_DIRS or name.startswith("."):
+                continue
+            rel = f".config/{name}"
+            if is_secret(rel):
+                continue
+            if not child.is_dir() and child.suffix not in ("", ".conf", ".toml", ".json"):
+                if name not in PRETTY:
+                    continue
+            risky = name in RISKY
+            found[name] = {
+                "name": name_for(name, "config"),
+                "kind": "config",
+                "paths": [f"~/{rel}"],
+                "target": "git",
+                "enabled": not risky,
+                "risky": risky,
+                "note": RISKY.get(name, ""),
+            }
+
+    for dot, label in DOTFILES.items():
+        if (HOME / dot).exists():
+            cid = dot.lstrip(".")
+            found[cid] = {
+                "name": label,
+                "kind": "dotfile",
+                "paths": [f"~/{dot}"],
+                "target": "git",
+                "enabled": True,
+                "risky": False,
+                "note": "",
+            }
+
+    for group in OMARCHY:
+        rel = group["paths"][0][2:]  # strip "~/"
+        if (HOME / rel).exists():
+            found[group["id"]] = {
+                "name": group["name"],
+                "kind": "omarchy",
+                "paths": group["paths"],
+                "target": "git",
+                "enabled": True,
+                "risky": False,
+                "note": "",
+                "exclude": group["exclude"],
+            }
+
+    for dirname, label in COMMON_DIRS.items():
+        folder = HOME / dirname
+        # List it whenever it exists, even if empty, so the Drive-defaulting
+        # folders are always visible to manage rather than appearing only once
+        # something happens to be in them.
+        if not folder.is_dir():
+            continue
+        found[f"personal-{dirname}"] = {
+            "name": label,
+            "kind": "personal",
+            "paths": [f"~/{dirname}"],
+            "target": "gdrive",
+            "enabled": True,
+            "risky": False,
+            "note": "Personal files — defaults to Google Drive.",
+        }
+
+    return found
+
+
+def merge_detected(state: dict) -> int:
+    """Add newly-detected apps, keep choices for ones already known."""
+    known = state["apps"]
+    hidden = set(state.get("hidden", []))
+    detected = detect()
+    changed = 0
+    for cid, candidate in detected.items():
+        if cid in hidden:
+            continue
+        if cid in known:
+            known[cid]["name"] = candidate["name"]
+            known[cid]["paths"] = candidate["paths"]
+            known[cid]["kind"] = candidate["kind"]
+            if "exclude" in candidate:
+                known[cid]["exclude"] = candidate["exclude"]
+        else:
+            known[cid] = candidate
+            changed += 1
+    # Drop entries that detection no longer offers, but keep hand-added ones.
+    for cid in list(known):
+        if cid not in detected and known[cid].get("kind") != "custom":
+            del known[cid]
+            changed += 1
+    state["apps"] = dict(sorted(known.items(), key=lambda kv: kv[1]["name"].lower()))
+    return changed
+
+
+# --- rsync plumbing --------------------------------------------------------
+
+def rsync_filter_args(excludes):
+    args = ["--exclude", "/" + ".*.swp"]
+    for pattern in EXCLUDES:
+        args += ["--exclude", pattern]
+    for pattern in excludes or []:
+        args += ["--exclude", "/" + pattern.strip("/")]
+    return args
+
+
+def rsync(src: Path, dst: Path, excludes, delete=False, update=False) -> None:
+    """Copy one path -> path with the standard excludes. Handles files and dirs."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src_is_dir = src.is_dir()
+    cmd = ["rsync", "-a", "--mkpath"]
+    if delete and src_is_dir:
+        cmd.append("--delete")
+    if update:
+        cmd.append("--update")
+    cmd += rsync_filter_args(excludes)
+    if src_is_dir:
+        cmd += [str(src) + "/", str(dst) + "/"]
+    else:
+        cmd += [str(src), str(dst)]
+    run(cmd)
+
+
+def home_rel(p: Path) -> str:
+    return str(p.relative_to(HOME))
+
+
+def store_root(target: str) -> Path:
+    return GDRIVE_STORE if target == "gdrive" else STORE
+
+
+def ensure_git_repo(state) -> str:
+    if not have("git"):
+        raise RuntimeError("git is not installed")
+    GIT_DIR.mkdir(parents=True, exist_ok=True)
+    if not (GIT_DIR / ".git").exists():
+        run(["git", "init", "-q", "-b", state["git"]["branch"]], cwd=GIT_DIR)
+    run(["git", "config", "user.name", os.environ.get("USER", "configsync")],
+        cwd=GIT_DIR, check=False)
+    run(["git", "config", "user.email", "configsync@localhost"], cwd=GIT_DIR, check=False)
+    remote = state["git"].get("remote", "").strip()
+    if remote:
+        run(["git", "remote", "remove", "origin"], cwd=GIT_DIR, check=False)
+        run(["git", "remote", "add", "origin", remote], cwd=GIT_DIR)
+    return remote
+
+
+# --- download / deploy -----------------------------------------------------
+#
+# `download` brings the backend's copy into a local store (nothing in $HOME is
+# touched); `deploy` writes the store back into $HOME. Keeping them apart means
+# a fresh machine can pull everything first, look, then deploy — and that a
+# download never silently overwrites a local file.
+
+def download(state, selected=None, dry=False):
+    messages = []
+    remote = state["git"].get("remote", "").strip()
+    branch = state["git"]["branch"]
+    if not remote:
+        messages.append("git: no remote set")
+    elif dry:
+        messages.append("git: would fetch and reset the store")
+    else:
+        ensure_git_repo(state)
+        run(["git", "fetch", "-q", "origin"], cwd=GIT_DIR, check=False)
+        has_remote = run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"],
+                         cwd=GIT_DIR, check=False).returncode == 0
+        if not has_remote:
+            messages.append("git: remote has no commits yet")
+        else:
+            before = run(["git", "rev-parse", "HEAD"], cwd=GIT_DIR, check=False).stdout.strip()
+            run(["git", "checkout", "-q", "-f", "-B", branch, f"origin/{branch}"], cwd=GIT_DIR)
+            after = run(["git", "rev-parse", "HEAD"], cwd=GIT_DIR, check=False).stdout.strip()
+            messages.append("git: downloaded latest" if before != after else "git: already up to date")
+
+    remote_raw = state["gdrive"].get("remote", "").strip()
+    if not remote_raw:
+        messages.append("drive: no folder set")
+    else:
+        remote_root = expand(remote_raw)
+        if not remote_root.exists():
+            raise RuntimeError(f"Google Drive folder not found: {remote_root}")
+        count = 0
+        for app in state["apps"].values():
+            if not app["enabled"] or app["target"] != "gdrive":
+                continue
+            if selected and app["id"] not in selected:
+                continue
+            for p in app["paths"]:
+                rel = home_rel(expand(p))
+                src = remote_root / rel
+                if not src.exists():
+                    continue
+                if dry:
+                    print(f"  would download {to_tilde(src)}")
+                    continue
+                rsync(src, GDRIVE_STORE / rel, app.get("exclude", []), update=True)
+                count += 1
+        messages.append(f"drive: {count} path(s) downloaded")
+    return "; ".join(messages)
+
+
+def deploy(state, selected=None, dry=False):
+    count = 0
+    for app in state["apps"].values():
+        if not app["enabled"] or app["target"] not in ("git", "gdrive"):
+            continue
+        if selected and app["id"] not in selected:
+            continue
+        root = store_root(app["target"])
+        for p in app["paths"]:
+            dest = expand(p)
+            src = root / home_rel(dest)
+            if not src.exists():
+                continue
+            if dry:
+                print(f"  would deploy {to_tilde(src)} -> {to_tilde(dest)}")
+                continue
+            rsync(src, dest, app.get("exclude", []))
+            count += 1
+    return f"deployed {count} path(s)"
+
+
+# --- software --------------------------------------------------------------
+#
+# `capture-software` records the Omarchy plugins you have (with their git
+# source) and the packages you installed on top of Arch, into a manifest that
+# travels with the rest of the config. `install-software` puts them back on a
+# fresh machine: plugins clone without privileges; packages are installed
+# through a terminal so pacman can ask for a password.
+
+def _omarchy_plugins():
+    if not have("omarchy"):
+        return []
+    proc = run(["omarchy", "plugin", "list", "--json"], check=False)
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _plugin_remote(pid: str) -> str:
+    folder = PLUGIN_DIR / pid
+    if not (folder / ".git").exists():
+        return ""
+    proc = run(["git", "-C", str(folder), "remote", "get-url", "origin"], check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _pacman(flag: str):
+    proc = run(["pacman", flag], check=False)
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def capture_software() -> dict:
+    plugins = []
+    for pl in _omarchy_plugins():
+        if pl.get("firstParty"):
+            continue
+        plugins.append({
+            "id": pl.get("id", ""),
+            "name": pl.get("name", ""),
+            "source": _plugin_remote(pl.get("id", "")),
+            "enabled": bool(pl.get("enabled")),
+        })
+    manifest = {
+        "capturedAt": time.strftime("%Y-%m-%d %H:%M"),
+        "host": socket.gethostname(),
+        "plugins": plugins,
+        "packages": {"native": _pacman("-Qqen"), "aur": _pacman("-Qqem")},
+    }
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
+def load_manifest():
+    if not MANIFEST.exists():
+        return None
+    try:
+        return json.loads(MANIFEST.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def software_summary() -> dict:
+    manifest = load_manifest()
+    if not manifest:
+        return {"captured": False, "plugins": 0, "packages": 0, "capturedAt": ""}
+    return {
+        "captured": True,
+        "plugins": len(manifest.get("plugins", [])),
+        "packages": len(manifest["packages"]["native"]) + len(manifest["packages"]["aur"]),
+        "capturedAt": manifest.get("capturedAt", ""),
+    }
+
+
+def _install_packages(native, aur) -> None:
+    steps = []
+    if native:
+        steps.append("omarchy pkg add " + " ".join(shlex.quote(p) for p in native))
+    if aur:
+        steps.append("omarchy pkg aur add " + " ".join(shlex.quote(p) for p in aur))
+    if not steps:
+        return
+    script = " && ".join(steps) + "\necho\necho 'Packages done. Press Enter to close.'\nread"
+    if sys.stdin.isatty():
+        run(["bash", "-lc", script], check=False)
+    else:
+        # No terminal here (the shell plugin): open one so pacman can prompt.
+        run(["omarchy-launch-terminal", "bash", "-lc", script], check=False)
+
+
+def install_software(dry=False) -> str:
+    manifest = load_manifest()
+    if not manifest:
+        return "no software manifest yet — run Sync on a machine that already has your setup"
+
+    installed_plugins = {p.get("id") for p in _omarchy_plugins()}
+    added = 0
+    skipped = 0
+    for pl in manifest.get("plugins", []):
+        if pl["id"] in installed_plugins:
+            continue
+        source = pl.get("source", "")
+        if not source:
+            skipped += 1
+            continue
+        if dry:
+            print(f"  would add plugin {pl['id']} from {source}")
+            continue
+        args = ["omarchy", "plugin", "add", source, "--yes"]
+        if pl.get("enabled"):
+            args.append("--enable")
+        run(args, check=False)
+        added += 1
+
+    have_pkgs = set(_pacman("-Qq"))
+    native = [p for p in manifest["packages"]["native"] if p not in have_pkgs]
+    aur = [p for p in manifest["packages"]["aur"] if p not in have_pkgs]
+    if not dry:
+        _install_packages(native, aur)
+
+    parts = [f"{added} plugin(s) installed"]
+    if skipped:
+        parts.append(f"{skipped} with no git source skipped")
+    parts.append(f"{len(native)} native + {len(aur)} AUR package(s) missing")
+    return "; ".join(parts)
+
+
+# --- backends --------------------------------------------------------------
+
+def git_sync(state, selected=None, dry=False):
+    if not have("git"):
+        raise RuntimeError("git is not installed")
+    apps = state["apps"]
+    picked = [a for a in apps.values() if a["enabled"] and (not selected or a["id"] in selected)] \
+        if selected else [a for a in apps.values() if a["enabled"]]
+    git_apps = [a for a in picked if a["target"] == "git"]
+    if not git_apps:
+        return 0, "nothing to push to git"
+
+    ident = ["-c", f"user.name={os.environ.get('USER', 'configsync')}",
+             "-c", "user.email=configsync@localhost"]
+
+    if not dry:
+        (GIT_DIR).mkdir(parents=True, exist_ok=True)
+        if not (GIT_DIR / ".git").exists():
+            run(["git", "init", "-q", "-b", state["git"]["branch"]], cwd=GIT_DIR)
+        run(["git", "config", "user.name", os.environ.get("USER", "configsync")],
+            cwd=GIT_DIR, check=False)
+        run(["git", "config", "user.email", "configsync@localhost"], cwd=GIT_DIR, check=False)
+
+    # 1. capture local state into the store
+    for app, path in ((a, expand(p)) for a in git_apps for p in a["paths"]):
+        if not path.exists():
+            continue
+        rel = home_rel(path)
+        if dry:
+            print(f"  would stage {rel}")
+            continue
+        rsync(path, STORE / rel, app.get("exclude", []), delete=True)
+
+    if dry:
+        return 0, "dry run"
+
+    # 2. commit
+    run(["git", "add", "-A"], cwd=GIT_DIR)
+    status = run(["git", "status", "--porcelain"], cwd=GIT_DIR).stdout.strip()
+    if status:
+        host = socket.gethostname()
+        msg = f"configsync {host} {time.strftime('%Y-%m-%d %H:%M')}"
+        run(["git", *ident, "commit", "-q", "-m", msg], cwd=GIT_DIR)
+
+    # 3. integrate + push
+    remote = state["git"].get("remote", "").strip()
+    branch = state["git"]["branch"]
+    if remote:
+        run(["git", "remote", "remove", "origin"], cwd=GIT_DIR, check=False)
+        run(["git", "remote", "add", "origin", remote], cwd=GIT_DIR)
+        run(["git", "fetch", "-q", "origin"], cwd=GIT_DIR, check=False)
+        has_remote = run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"],
+                         cwd=GIT_DIR, check=False).returncode == 0
+        if has_remote:
+            rebase = run(["git", *ident, "rebase", f"origin/{branch}"],
+                         cwd=GIT_DIR, check=False)
+            if rebase.returncode != 0:
+                run(["git", "rebase", "--abort"], cwd=GIT_DIR, check=False)
+                raise RuntimeError(
+                    "conflict with the remote — the same file changed on both sides. "
+                    "Resolve it in the git backend repo and sync again.")
+        run(["git", "push", "-q", "-u", "origin", branch], cwd=GIT_DIR)
+
+    # 4. apply whatever the merge brought back
+    for app, path in ((a, expand(p)) for a in git_apps for p in a["paths"]):
+        rel = home_rel(path)
+        if (STORE / rel).exists():
+            rsync(STORE / rel, path, app.get("exclude", []))
+
+    return 0, f"git: {len(git_apps)} app(s) up to date"
+
+
+def gdrive_sync(state, selected=None, dry=False):
+    remote_root_raw = state["gdrive"].get("remote", "").strip()
+    if not remote_root_raw:
+        return 0, "skipped: no Google Drive folder set"
+    if not have("rsync"):
+        raise RuntimeError("rsync is not installed")
+    remote_root = expand(remote_root_raw)
+    if not dry and not remote_root.exists():
+        raise RuntimeError(f"Google Drive folder not found: {remote_root}")
+
+    apps = [a for a in state["apps"].values()
+            if a["enabled"] and a["target"] == "gdrive" and (not selected or a["id"] in selected)]
+    if not apps:
+        return 0, "nothing to push to Google Drive"
+
+    delete = bool(state["gdrive"].get("delete", False))
+    count = 0
+    for app in apps:
+        for p in app["paths"]:
+            src = expand(p)
+            if not src.exists():
+                continue
+            dst = remote_root / home_rel(src)
+            if dry:
+                print(f"  would rsync {to_tilde(src)} <-> {to_tilde(dst)}")
+                continue
+            rsync(src, dst, app.get("exclude", []), delete=delete, update=True)  # push newer
+            rsync(dst, src, app.get("exclude", []), update=True)                 # pull newer
+            count += 1
+    return 0, f"Google Drive: {count} path(s) reconciled"
+
+
+# --- commands --------------------------------------------------------------
+
+def cmd_scan(args):
+    state = load_state()
+    added = merge_detected(state)
+    save_state(state)
+    print(f"detected {len(state['apps'])} apps ({added} new/changed)")
+
+
+def cmd_state(args):
+    state = load_state()
+    apps = [dict(id=cid, **app) for cid, app in state["apps"].items()]
+    apps.sort(key=lambda a: a["name"].lower())
+    gdrive_remote = state["gdrive"].get("remote", "").strip()
+    out = {
+        "version": state["version"],
+        "git": {
+            "remote": state["git"].get("remote", ""),
+            "branch": state["git"].get("branch", "main"),
+            "configured": bool(state["git"].get("remote", "").strip()),
+        },
+        "gdrive": {
+            "remote": state["gdrive"].get("remote", ""),
+            "configured": bool(gdrive_remote),
+            "available": bool(gdrive_remote) and expand(gdrive_remote).exists(),
+        },
+        "auto": state["auto"],
+        "lastSync": state["lastSync"],
+        "software": software_summary(),
+        "apps": apps,
+    }
+    print(json.dumps(out, indent=2))
+
+
+def _app(state, cid):
+    if cid not in state["apps"]:
+        sys.exit(f"unknown app: {cid}")
+    return state["apps"][cid]
+
+
+def cmd_set_enabled(args):
+    state = load_state()
+    _app(state, args.id)["enabled"] = args.value == "true"
+    save_state(state)
+    print("ok")
+
+
+def cmd_set_target(args):
+    if args.value not in ("git", "gdrive", "none"):
+        sys.exit("target must be git, gdrive or none")
+    state = load_state()
+    _app(state, args.id)["target"] = args.value
+    save_state(state)
+    print("ok")
+
+
+def cmd_set_backend(args):
+    state = load_state()
+    if args.backend == "git":
+        if args.key == "remote":
+            state["git"]["remote"] = args.value
+        elif args.key == "branch":
+            state["git"]["branch"] = args.value or "main"
+        else:
+            sys.exit("git accepts remote or branch")
+    elif args.backend == "gdrive":
+        if args.key == "remote":
+            state["gdrive"]["remote"] = args.value
+        elif args.key == "delete":
+            state["gdrive"]["delete"] = args.value == "true"
+        else:
+            sys.exit("gdrive accepts remote or delete")
+    elif args.backend == "auto":
+        if args.key == "enabled":
+            state["auto"]["enabled"] = args.value == "true"
+        elif args.key == "interval":
+            state["auto"]["intervalMinutes"] = max(5, int(args.value))
+        else:
+            sys.exit("auto accepts enabled or interval")
+    else:
+        sys.exit("unknown backend")
+    save_state(state)
+    print("ok")
+
+
+def cmd_set_all(args):
+    state = load_state()
+    for app in state["apps"].values():
+        app["enabled"] = args.value == "true"
+    save_state(state)
+    print("ok")
+
+
+def cmd_sync(args):
+    state = load_state()
+    selected = set(args.ids) if args.ids else None
+    messages = []
+    ok = True
+    try:
+        # Refresh the software manifest first so this same sync carries it.
+        if not args.dry_run:
+            capture_software()
+        if not args.only or args.only == "git":
+            _, msg = git_sync(state, selected, dry=args.dry_run)
+            messages.append(msg)
+        if not args.only or args.only == "gdrive":
+            _, msg = gdrive_sync(state, selected, dry=args.dry_run)
+            messages.append(msg)
+    except Exception as exc:  # noqa: BLE001 — report, never crash the shell
+        ok = False
+        messages.append(str(exc).splitlines()[0])
+    _record(state, ok, "; ".join(messages))
+
+
+def _record(state, ok, message):
+    # Re-read the file before writing: a long sync (or a background auto-sync)
+    # must not clobber a toggle the user flipped in the panel meanwhile. Only
+    # the last-sync result is ours to write.
+    fresh = load_state()
+    fresh["lastSync"] = {
+        "at": time.strftime("%Y-%m-%d %H:%M"),
+        "ok": ok,
+        "message": message,
+    }
+    save_state(fresh)
+    print(message)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_download(args):
+    state = load_state()
+    selected = set(args.ids) if args.ids else None
+    try:
+        _record(state, True, download(state, selected, dry=args.dry_run))
+    except Exception as exc:  # noqa: BLE001
+        _record(state, False, str(exc).splitlines()[0])
+
+
+def cmd_deploy(args):
+    state = load_state()
+    selected = set(args.ids) if args.ids else None
+    try:
+        _record(state, True, deploy(state, selected, dry=args.dry_run))
+    except Exception as exc:  # noqa: BLE001
+        _record(state, False, str(exc).splitlines()[0])
+
+
+def cmd_capture_software(args):
+    manifest = capture_software()
+    print(f"captured {len(manifest['plugins'])} plugin(s) and "
+          f"{len(manifest['packages']['native'])} + {len(manifest['packages']['aur'])} package(s)")
+
+
+def cmd_install_software(args):
+    state = load_state()
+    try:
+        _record(state, True, install_software(dry=args.dry_run))
+    except Exception as exc:  # noqa: BLE001
+        _record(state, False, str(exc).splitlines()[0])
+
+
+def cmd_reset(args):
+    state = default_state()
+    merge_detected(state)
+    save_state(state)
+    if args.purge:
+        shutil.rmtree(GIT_DIR, ignore_errors=True)
+        shutil.rmtree(GDRIVE_STORE, ignore_errors=True)
+    print("reset" + (" and purged local data" if args.purge else ""))
+
+
+def cmd_add(args):
+    state = load_state()
+    target = expand(args.path)
+    if not target.exists():
+        sys.exit(f"no such file or folder: {args.path}")
+    if not target.is_relative_to(HOME):
+        sys.exit("only paths inside your home directory can be synced")
+    rel = home_rel(target)
+    if is_secret(rel):
+        sys.exit("refusing to sync a credentials path")
+    cid = args.id or ("custom-" + rel.strip("/").replace("/", "-"))
+    state["apps"][cid] = {
+        "name": args.name or rel,
+        "kind": "custom",
+        "paths": [to_tilde(target)],
+        "target": args.target,
+        "enabled": True,
+        "risky": False,
+        "note": "added by you",
+    }
+    save_state(state)
+    print(f"added {cid}")
+
+
+def cmd_remove(args):
+    state = load_state()
+    if args.id not in state["apps"]:
+        sys.exit(f"unknown app: {args.id}")
+    # A hand-added path is deleted outright; a detected one is remembered as
+    # hidden so the next scan does not put it straight back.
+    if state["apps"][args.id].get("kind") != "custom":
+        hidden = set(state.get("hidden", []))
+        hidden.add(args.id)
+        state["hidden"] = sorted(hidden)
+    del state["apps"][args.id]
+    save_state(state)
+    print("removed")
+
+
+def cmd_status(args):
+    st = load_state()["lastSync"]
+    print(f"{'ok' if st['ok'] else 'error'}: {st['message']} ({st['at'] or 'never'})")
+
+
+def cmd_which(args):
+    for backend, path in (("git repo", GIT_DIR), ("git store", STORE),
+                          ("drive store", GDRIVE_STORE), ("state", STATE_FILE)):
+        print(f"{backend}: {to_tilde(path)}")
+
+
+# --- entry -----------------------------------------------------------------
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="configsync", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("scan", help="detect installed apps and merge into state")
+
+    sub.add_parser("state", help="print the whole state as JSON")
+    sub.add_parser("status", help="print the last sync result")
+    sub.add_parser("which", help="print the paths this tool uses")
+
+    p = sub.add_parser("set-enabled", help="turn syncing for one app on/off")
+    p.add_argument("id")
+    p.add_argument("value", choices=["true", "false"])
+    p.set_defaults(func=cmd_set_enabled)
+
+    p = sub.add_parser("set-target", help="send one app to git, gdrive or none")
+    p.add_argument("id")
+    p.add_argument("value")
+    p.set_defaults(func=cmd_set_target)
+
+    p = sub.add_parser("set-backend", help="configure a backend (remote, branch, ...)")
+    p.add_argument("backend")
+    p.add_argument("key")
+    p.add_argument("value")
+    p.set_defaults(func=cmd_set_backend)
+
+    p = sub.add_parser("set-all", help="turn every app on or off at once")
+    p.add_argument("value", choices=["true", "false"])
+    p.set_defaults(func=cmd_set_all)
+
+    p = sub.add_parser("sync", help="sync the enabled apps")
+    p.add_argument("ids", nargs="*", help="only these app ids (default: all enabled)")
+    p.add_argument("--only", choices=["git", "gdrive"])
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("download", help="bring the backends' files into the local store")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("deploy", help="write the local store into your home directory")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_deploy)
+
+    p = sub.add_parser("reset", help="reset the plugin state to defaults")
+    p.add_argument("--purge", action="store_true", help="also delete local repos/stores")
+    p.set_defaults(func=cmd_reset)
+
+    p = sub.add_parser("add", help="add a file or folder of your own to sync")
+    p.add_argument("path")
+    p.add_argument("--name")
+    p.add_argument("--id")
+    p.add_argument("--target", choices=["git", "gdrive"], default="git")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("remove", help="stop syncing an app or custom path")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("capture-software", help="record installed plugins and packages")
+    p.set_defaults(func=cmd_capture_software)
+
+    p = sub.add_parser("install-software", help="reinstall plugins and packages from the manifest")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_install_software)
+
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        args.func = {"scan": cmd_scan, "state": cmd_state, "status": cmd_status,
+                     "which": cmd_which}[args.cmd]
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

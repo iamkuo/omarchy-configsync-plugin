@@ -1,0 +1,9 @@
+# Local backups and scratch
+*.bak
+*.bak.*
+*.tmp
+*~
+
+# Python bytecode (the CLI is run as a script, but be safe)
+__pycache__/
+*.pyc

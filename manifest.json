@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ryankuo.configsync",
+  "name": "Config Sync",
+  "version": "0.1.0",
+  "author": "ryankuo",
+  "license": "MIT",
+  "description": "Detect installed apps and their config files, then sync the ones you choose across machines. Small configs go through a git repo; large personal files go through rsync to a Google Drive folder. Secrets and credentials are never touched.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Config Sync",
+    "description": "Pick which app configs sync, and where they go",
+    "category": "System",
+    "aliases": ["sync", "dotfiles", "config", "backup", "git", "gdrive"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
