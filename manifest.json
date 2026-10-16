@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "author": "ryankuo",
   "license": "MIT",
+  "homepage": "https://github.com/iamkuo/omarchy-configsync-plugin",
   "description": "Detect installed apps and their config files, then sync the ones you choose across machines. Small configs go through a git repo; large personal files go through rsync to a Google Drive folder. Secrets and credentials are never touched.",
   "kinds": [
     "bar-widget",
