@@ -19,7 +19,8 @@ It is a bar widget plus a headless service, backed by a scriptable CLI.
 `Super+Space` → search "Config Sync", or click the sync icon on the bar.
 
 The popup imitates Omaplug's layout: a title header with the item count, the two
-backend fields, then **two subtabs** — **Apps** and **Folders** — each a
+backend fields, then **three subtabs** — **Apps**, **Folders** and **Repos** —
+each a
 single-column list of compact cards. Every card has a colour tile, the name and
 path, a **Git/Drive** picker, a remove `✕`, and the on/off switch. Splitting the
 two keeps configs out of the way when you are managing personal folders, and
@@ -178,6 +179,7 @@ configsync add <path> [--name N] [--target git|gdrive]
 configsync remove <id>               # delete a custom path, or hide a detected one
 configsync capture-software          # record plugins + packages into the manifest
 configsync install-software          # reinstall missing plugins + packages
+configsync repos                     # list git repositories on the machine
 configsync reset [--purge]           # reset state (--purge also deletes local repos)
 ```
 
@@ -188,7 +190,23 @@ configsync reset [--purge]           # reset state (--purge also deletes local r
 
 While the popup is focused: **Page Up / Page Down** scroll the list,
 **Up/Down** scroll a little, **Home/End** jump to the ends, and **Tab** flips
-between the Apps and Folders subtabs. **Escape** closes.
+between the Apps, Folders and Repos subtabs. **Escape** closes.
+
+## Repositories
+
+The **Repos** tab is a read-only inventory of the git repositories on the
+machine: every clone under `$HOME` (including the Omarchy plugin checkouts and
+the sync backend itself), with its branch, whether it has uncommitted changes,
+how far ahead/behind its upstream it is, and its origin URL.
+
+Scanning is depth-limited and skips caches, `node_modules`, app profiles, and
+any mounted filesystem (so the Google Drive mount is never walked). It takes
+well under a second. **Refresh** rescans; it also runs when the tab is opened.
+
+```bash
+configsync repos                     # JSON inventory (same data the tab shows)
+```
+
 
 ## Files
 

@@ -30,6 +30,8 @@ Panel {
   readonly property string scriptPath: Qt.resolvedUrl("bin/configsync").toString().replace("file://", "")
 
   property var stateData: ({ apps: [], git: {}, gdrive: {}, auto: {}, lastSync: {} })
+  property var reposData: []
+  property bool reposBusy: false
   property bool loaded: false
   property bool busy: false
   property bool refreshOwed: false
@@ -75,7 +77,8 @@ Panel {
   }
   readonly property var tabOptions: [
     { value: "apps", label: "Apps · " + appEntries.length },
-    { value: "folders", label: "Folders · " + folderEntries.length }
+    { value: "folders", label: "Folders · " + folderEntries.length },
+    { value: "repos", label: "Repos · " + root.reposData.length }
   ]
   readonly property int enabledCount: {
     var n = 0
@@ -102,6 +105,63 @@ Panel {
     if (stateProc.running) { root.refreshOwed = true; return }
     stateProc.command = ["python3", root.scriptPath, "state"]
     stateProc.running = true
+  }
+
+  function refreshRepos() {
+    if (reposProc.running) return
+    root.reposBusy = true
+    reposProc.command = ["python3", root.scriptPath, "repos"]
+    reposProc.running = true
+  }
+
+  function focusActiveList() {
+    Qt.callLater(function() {
+      if (root.tab === "repos") { if (repoList) repoList.forceActiveFocus() }
+      else if (list) list.forceActiveFocus()
+    })
+  }
+
+  function setTab(value) {
+    if (root.tab === value) return
+    root.tab = value
+    if (value === "repos") root.refreshRepos()
+    root.focusActiveList()
+  }
+
+  function cycleTab(direction) {
+    var order = ["apps", "folders", "repos"]
+    var i = order.indexOf(root.tab)
+    var next = order[(i + (direction < 0 ? order.length - 1 : 1)) % order.length]
+    root.setTab(next)
+    Qt.callLater(function() {
+      var view = root.tab === "repos" ? repoList : list
+      if (view) view.positionViewAtBeginning()
+    })
+  }
+
+  // Shared Page Up/Down, Home/End and arrow scrolling for whichever list is
+  // showing; Tab walks the tabs.
+  function handleListKeys(view, event) {
+    var page = Math.max(1, view.height - Style.space(48))
+    var maxY = Math.max(0, view.contentHeight - view.height)
+    if (event.key === Qt.Key_PageDown) {
+      view.contentY = Math.min(maxY, view.contentY + page); event.accepted = true
+    } else if (event.key === Qt.Key_PageUp) {
+      view.contentY = Math.max(0, view.contentY - page); event.accepted = true
+    } else if (event.key === Qt.Key_Home) {
+      view.positionViewAtBeginning(); event.accepted = true
+    } else if (event.key === Qt.Key_End) {
+      view.positionViewAtEnd(); event.accepted = true
+    } else if (event.key === Qt.Key_Down) {
+      view.contentY = Math.min(maxY, view.contentY + Style.space(40)); event.accepted = true
+    } else if (event.key === Qt.Key_Up) {
+      view.contentY = Math.max(0, view.contentY - Style.space(40)); event.accepted = true
+    } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+      var back = event.key === Qt.Key_Backtab || (event.modifiers & Qt.ShiftModifier)
+      root.cycleTab(back ? -1 : 1); event.accepted = true
+    } else if (event.key === Qt.Key_Escape) {
+      root.close(); event.accepted = true
+    }
   }
 
   // Replace the state but keep the list where the reader left it — a target
@@ -182,14 +242,37 @@ Panel {
     onRunningChanged: if (!running && root.refreshOwed) { root.refreshOwed = false; root.refresh() }
   }
 
+  Process {
+    id: reposProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var list = JSON.parse(text)
+          if (list && list.length !== undefined) root.reposData = list
+        } catch (e) {
+          // Leave the last inventory on screen.
+        }
+      }
+    }
+    onRunningChanged: if (!running) root.reposBusy = false
+  }
+
   Timer {
     id: resetTimer
     interval: 4000
     onTriggered: root.resetArmed = false
   }
 
-  onOpenedChanged: if (opened) root.refresh()
-  Component.onCompleted: root.refresh()
+  onOpenedChanged: {
+    if (!opened) return
+    root.refresh()
+    if (root.tab === "repos") root.refreshRepos()
+  }
+  Component.onCompleted: {
+    root.refresh()
+    root.refreshRepos()
+  }
 
   KeyboardPanel {
     id: panel
@@ -197,7 +280,7 @@ Panel {
     owner: root.hostWidget || root
     bar: root.bar
     open: root.opened
-    focusTarget: list
+    focusTarget: root.tab === "repos" ? repoList : list
     contentWidth: panel.fittedContentWidth(Style.space(540))
     contentHeight: panel.fittedContentHeight(Style.space(640))
 
@@ -414,10 +497,26 @@ Panel {
           foreground: root.contentForeground
           accent: Color.accent
           fontFamily: root.contentFontFamily
-          onChanged: function(value) { root.tab = value }
+          onChanged: function(value) { root.setTab(value) }
         }
 
         Item { Layout.fillWidth: true; Layout.preferredHeight: 1 }
+
+        Button {
+          visible: root.tab === "repos"
+          text: root.reposBusy ? "Scanning…" : "Refresh"
+          tooltipText: "Rescan the git repositories on this machine"
+          bordered: true
+          enabled: !root.reposBusy
+          foreground: root.contentForeground
+          accent: Color.accent
+          fontFamily: root.contentFontFamily
+          fontSize: Style.font.caption
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(3)
+          Layout.alignment: Qt.AlignVCenter
+          onClicked: root.refreshRepos()
+        }
       }
 
       // ---- add your own path (Folders tab) ---------------------------------
@@ -449,50 +548,54 @@ Panel {
       }
 
       // ---- item list -------------------------------------------------------
-      ListView {
-        id: list
+      Item {
         Layout.fillWidth: true
         Layout.fillHeight: true
         Layout.minimumHeight: Style.space(160)
-        clip: true
-        model: root.shown
-        boundsBehavior: Flickable.StopAtBounds
-        reuseItems: true
-        focus: true
-        keyNavigationEnabled: false
 
-        delegate: Cells.AppCell {
-          width: list.width
-          foreground: root.contentForeground
-          fontFamily: root.contentFontFamily
-          onToggleRequested: function(app) { root.toggleApp(app) }
-          onTargetRequested: function(app, value) { root.setTarget(app, value) }
-          onRemoveRequested: function(app) { root.removeApp(app) }
+        ListView {
+          id: list
+          anchors.fill: parent
+          visible: root.tab !== "repos"
+          clip: true
+          model: root.shown
+          boundsBehavior: Flickable.StopAtBounds
+          reuseItems: true
+          focus: root.tab !== "repos"
+          keyNavigationEnabled: false
+
+          delegate: Cells.AppCell {
+            width: list.width
+            foreground: root.contentForeground
+            fontFamily: root.contentFontFamily
+            onToggleRequested: function(app) { root.toggleApp(app) }
+            onTargetRequested: function(app, value) { root.setTarget(app, value) }
+            onRemoveRequested: function(app) { root.removeApp(app) }
+          }
+
+          Keys.priority: Keys.BeforeItem
+          Keys.onPressed: function(event) { root.handleListKeys(list, event) }
         }
 
-        Keys.priority: Keys.BeforeItem
-        Keys.onPressed: function(event) {
-          var page = Math.max(1, list.height - Style.space(48))
-          var maxY = Math.max(0, list.contentHeight - list.height)
-          if (event.key === Qt.Key_PageDown) {
-            list.contentY = Math.min(maxY, list.contentY + page); event.accepted = true
-          } else if (event.key === Qt.Key_PageUp) {
-            list.contentY = Math.max(0, list.contentY - page); event.accepted = true
-          } else if (event.key === Qt.Key_Home) {
-            list.positionViewAtBeginning(); event.accepted = true
-          } else if (event.key === Qt.Key_End) {
-            list.positionViewAtEnd(); event.accepted = true
-          } else if (event.key === Qt.Key_Down) {
-            list.contentY = Math.min(maxY, list.contentY + Style.space(40)); event.accepted = true
-          } else if (event.key === Qt.Key_Up) {
-            list.contentY = Math.max(0, list.contentY - Style.space(40)); event.accepted = true
-          } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
-            root.tab = root.tab === "apps" ? "folders" : "apps"
-            list.positionViewAtBeginning()
-            event.accepted = true
-          } else if (event.key === Qt.Key_Escape) {
-            root.close(); event.accepted = true
+        ListView {
+          id: repoList
+          anchors.fill: parent
+          visible: root.tab === "repos"
+          clip: true
+          model: root.reposData
+          boundsBehavior: Flickable.StopAtBounds
+          reuseItems: true
+          focus: root.tab === "repos"
+          keyNavigationEnabled: false
+
+          delegate: Cells.RepoCell {
+            width: repoList.width
+            foreground: root.contentForeground
+            fontFamily: root.contentFontFamily
           }
+
+          Keys.priority: Keys.BeforeItem
+          Keys.onPressed: function(event) { root.handleListKeys(repoList, event) }
         }
       }
 

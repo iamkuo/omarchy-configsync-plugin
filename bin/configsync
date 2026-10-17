@@ -576,6 +576,93 @@ def install_software(dry=False) -> str:
     return "; ".join(parts)
 
 
+# --- repositories ----------------------------------------------------------
+#
+# A read-only inventory of the git repos on the machine: where they are, their
+# origin, branch and whether they are dirty or ahead/behind. Mounts and the
+# usual heavy trees are skipped so scanning the home directory stays quick.
+
+SCAN_PRUNE = {
+    ".cache", ".local", ".npm", ".cargo", ".rustup", ".gradle", ".m2", ".gem",
+    ".nvm", ".pyenv", ".conda", ".vscode-server", ".ollama", ".steam", "Steam",
+    "node_modules", ".venv", "venv", "env", "target", "build", "dist", ".Trash",
+    "snap", ".var", "__pycache__", ".git",
+    # big app profiles that are not repos
+    "Code", "chromium", "google-chrome", "google-chrome-beta",
+    "google-chrome-unstable", "BraveSoftware", "microsoft-edge",
+    "microsoft-edge-dev", "mozilla", "opencode", "Proton",
+}
+SCAN_MAX_DEPTH = 6
+
+
+def _git(path: Path, *args) -> str:
+    proc = run(["git", "-C", str(path), *args], check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _repo_info(path: Path) -> dict:
+    branch = _git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    remote = _git(path, "remote", "get-url", "origin")
+    dirty = bool(_git(path, "status", "--porcelain"))
+    ahead = behind = 0
+    upstream = _git(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if upstream:
+        counts = _git(path, "rev-list", "--left-right", "--count", "@{u}...HEAD").split()
+        if len(counts) == 2:
+            behind, ahead = int(counts[0]), int(counts[1])
+    return {
+        "path": to_tilde(path),
+        "name": path.name,
+        "branch": branch,
+        "remote": remote,
+        "dirty": dirty,
+        "ahead": ahead,
+        "behind": behind,
+        "last": _git(path, "log", "-1", "--format=%cr"),
+    }
+
+
+def find_repos():
+    state = load_state()
+    drive_top = ""
+    remote = state["gdrive"].get("remote", "").strip()
+    if remote:
+        try:
+            parts = expand(remote).relative_to(HOME).parts
+            if parts:
+                drive_top = parts[0]
+        except ValueError:
+            pass
+
+    repos = {}
+    home_depth = len(HOME.parts)
+
+    for root, dirs, _files in os.walk(HOME, topdown=True):
+        rootp = Path(root)
+        depth = len(rootp.parts) - home_depth
+        if depth > SCAN_MAX_DEPTH:
+            dirs[:] = []
+            continue
+        dirs[:] = [
+            d for d in dirs
+            if d not in SCAN_PRUNE
+            and d != drive_top
+            and not os.path.ismount(os.path.join(root, d))
+            and not os.path.islink(os.path.join(root, d))
+        ]
+        if ".git" in dirs or (rootp / ".git").exists():
+            repos[str(rootp)] = _repo_info(rootp)
+            dirs[:] = []  # a repo is a leaf; do not walk its contents
+
+    # The sync backend repo sits under a pruned .local, so add it explicitly.
+    if (GIT_DIR / ".git").exists():
+        info = _repo_info(GIT_DIR)
+        info["name"] = "Config Sync (backend)"
+        repos[str(GIT_DIR)] = info
+
+    return sorted(repos.values(), key=lambda r: r["name"].lower())
+
+
 # --- backends --------------------------------------------------------------
 
 def git_sync(state, selected=None, dry=False):
@@ -901,6 +988,10 @@ def cmd_which(args):
         print(f"{backend}: {to_tilde(path)}")
 
 
+def cmd_repos(args):
+    print(json.dumps(find_repos(), indent=2))
+
+
 # --- entry -----------------------------------------------------------------
 
 def main(argv=None):
@@ -913,6 +1004,7 @@ def main(argv=None):
     sub.add_parser("state", help="print the whole state as JSON")
     sub.add_parser("status", help="print the last sync result")
     sub.add_parser("which", help="print the paths this tool uses")
+    sub.add_parser("repos", help="list git repositories on the machine").set_defaults(func=cmd_repos)
 
     p = sub.add_parser("set-enabled", help="turn syncing for one app on/off")
     p.add_argument("id")
