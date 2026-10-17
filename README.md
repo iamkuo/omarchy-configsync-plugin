@@ -27,19 +27,18 @@ two keeps configs out of the way when you are managing personal folders, and
 vice versa.
 
 ```
-┌ ⣿  CONFIG SYNC             ⟳  Reset ┐
-│   47 items · 35 syncing             │
-│ [Download] [Deploy] [Sync now]      │
-│ GIT REPO           DRIVE FOLDER     │
-│ [git@github.com…] [~/Drive/…     ]  │
-│ ( Apps · 46 ) ( Folders · 1 )       │
-│ ⬒ Alacritty  ~/.config/alacritty    │
-│      [Git][Drive]  ✕          [ on ]│
-│ ⚠ Chromium  Browser profile         │
-│                        ✕     [ off ]│
-│ …                                   │
-│ git: 33 up to date           Auto[ ]│
-└─────────────────────────────────────┘
+┌ ⣿  CONFIG SYNC          ⟳ Sync now ⋯ ┐
+│   47 items · 35 syncing              │
+│ GIT REPO           DRIVE FOLDER      │
+│ [git@github.com…] [~/Drive/…      ]  │
+│ ( Apps · 46 ) ( Folders · 1 )        │
+│ ⬒ Alacritty  ~/.config/alacritty     │
+│      [Git][Drive]  ✕          [ on ] │
+│ ⚠ Chromium  Browser profile          │
+│                        ✕     [ off ] │
+│ …                                    │
+│ git: 33 up to date            Auto[ ]│
+└──────────────────────────────────────┘
 ```
 
 The **switch** decides whether an item syncs at all — turning sync off is the
@@ -53,13 +52,15 @@ where:
 
 The `✕` removes a row: a folder you added is deleted outright, and a detected
 app is remembered as hidden so the next scan does not put it straight back
-(the **Reset** button brings everything back).
+(the **Reset plugin** item brings everything back).
 
-The header **⟳** rescans, the **package** button reinstalls your plugins and
-packages (see below), **Reset** clears toggles and settings (click twice), and
-the actions are **Download** (pull the backends into the local store),
-**Deploy** (write the store into `$HOME`), and **Sync now** (capture, push and
-apply). The Folders tab has a field to **add your own folder or file**.
+The header has **⟳** (rescan), **Sync now** (capture, push and apply), and a
+**⋯** menu with the less-used actions: **Download** (pull the backends into the
+local store), **Deploy** (write the store into `$HOME`), **Reinstall software**
+(plugins + packages), **Rescan apps**, and **Reset plugin** (click twice to
+confirm). Keeping one primary action means you cannot press the wrong
+push/pull button, and every operation takes a lock so two can never run at
+once. The Folders tab has a field to **add your own folder or file**.
 
 
 

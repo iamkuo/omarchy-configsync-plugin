@@ -342,77 +342,6 @@ Panel {
         }
 
         Button {
-          iconText: "󰏗"
-          tooltipText: {
-            var s = root.stateData.software || {}
-            if (!s.captured) return "Reinstall plugins and packages — run Sync first to capture them"
-            return "Reinstall " + s.plugins + " plugin(s) and " + s.packages
-              + " package(s) recorded " + (s.capturedAt || "")
-          }
-          bordered: true
-          enabled: !root.busy && !!(root.stateData.software && root.stateData.software.captured)
-          foreground: root.contentForeground
-          accent: Color.accent
-          fontFamily: root.contentFontFamily
-          horizontalPadding: Style.space(8)
-          verticalPadding: Style.space(4)
-          Layout.alignment: Qt.AlignVCenter
-          onClicked: root.run(["install-software"])
-        }
-
-        Button {
-          text: root.resetArmed ? "Sure?" : "Reset"
-          tooltipText: root.resetArmed
-            ? "Click again to reset the plugin"
-            : "Reset toggles and settings to defaults"
-          bordered: true
-          foreground: root.resetArmed ? Color.urgent : root.contentForeground
-          accent: Color.accent
-          fontFamily: root.contentFontFamily
-          fontSize: Style.font.caption
-          horizontalPadding: Style.space(8)
-          verticalPadding: Style.space(4)
-          Layout.alignment: Qt.AlignVCenter
-          onClicked: root.resetPlugin()
-        }
-      }
-
-      // ---- actions ---------------------------------------------------------
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: Style.space(8)
-
-        Button {
-          iconText: "󰇚"
-          text: "Download"
-          tooltipText: "Pull the backends' files into the local store"
-          bordered: true
-          enabled: !root.busy
-          foreground: root.contentForeground
-          accent: Color.accent
-          fontFamily: root.contentFontFamily
-          fontSize: Style.font.caption
-          horizontalPadding: Style.space(8)
-          verticalPadding: Style.space(4)
-          onClicked: root.run(["download"])
-        }
-
-        Button {
-          iconText: "󰒲"
-          text: "Deploy"
-          tooltipText: "Write the local store into your home directory"
-          bordered: true
-          enabled: !root.busy
-          foreground: root.contentForeground
-          accent: Color.accent
-          fontFamily: root.contentFontFamily
-          fontSize: Style.font.caption
-          horizontalPadding: Style.space(8)
-          verticalPadding: Style.space(4)
-          onClicked: root.run(["deploy"])
-        }
-
-        Button {
           iconText: "󰓦"
           text: "Sync now"
           tooltipText: "Capture, push and apply the enabled items"
@@ -424,10 +353,134 @@ Panel {
           fontSize: Style.font.caption
           horizontalPadding: Style.space(8)
           verticalPadding: Style.space(4)
+          Layout.alignment: Qt.AlignVCenter
           onClicked: root.run(["sync"])
         }
 
-        Item { Layout.fillWidth: true; Layout.preferredHeight: 1 }
+        Button {
+          id: overflowButton
+          iconText: "⋯"
+          tooltipText: "More actions"
+          bordered: true
+          foreground: root.contentForeground
+          accent: Color.accent
+          fontFamily: root.contentFontFamily
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(4)
+          Layout.alignment: Qt.AlignVCenter
+          onClicked: overflowMenu.opened ? overflowMenu.close() : overflowMenu.open()
+        }
+
+        Popup {
+          id: overflowMenu
+          parent: overflowButton
+          x: overflowButton.width - width
+          y: overflowButton.height + Style.space(4)
+          padding: Style.space(4)
+          modal: false
+          closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+          background: BorderSurface {
+            color: Color.popups.background
+            borderSpec: Border.localOrSurfaceSpec("popups", "border", Color.popups.border, Color.popups.border, Math.max(1, Style.space(2)))
+            radius: Style.cornerRadius
+          }
+
+          contentItem: ColumnLayout {
+            spacing: Style.space(2)
+            implicitWidth: Style.space(220)
+
+            Button {
+              text: "Download from backends"
+              tooltipText: "Pull the backends' files into the local store"
+              enabled: !root.busy
+              leftAlign: true
+              Layout.fillWidth: true
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(5)
+              foreground: root.contentForeground
+              accent: Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: { overflowMenu.close(); root.run(["download"]) }
+            }
+
+            Button {
+              text: "Deploy to system"
+              tooltipText: "Write the local store into your home directory"
+              enabled: !root.busy
+              leftAlign: true
+              Layout.fillWidth: true
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(5)
+              foreground: root.contentForeground
+              accent: Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: { overflowMenu.close(); root.run(["deploy"]) }
+            }
+
+            Button {
+              text: "Reinstall software"
+              tooltipText: {
+                var s = root.stateData.software || {}
+                if (!s.captured) return "Run Sync first to capture your plugins and packages"
+                return s.plugins + " plugin(s), " + s.packages + " package(s)"
+              }
+              enabled: !root.busy && !!(root.stateData.software && root.stateData.software.captured)
+              leftAlign: true
+              Layout.fillWidth: true
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(5)
+              foreground: root.contentForeground
+              accent: Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: { overflowMenu.close(); root.run(["install-software"]) }
+            }
+
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: 1
+              color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.12)
+            }
+
+            Button {
+              text: "Rescan apps"
+              enabled: !root.busy
+              leftAlign: true
+              Layout.fillWidth: true
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(5)
+              foreground: root.contentForeground
+              accent: Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: { overflowMenu.close(); root.run(["scan"]) }
+            }
+
+            Button {
+              text: root.resetArmed ? "Sure? Reset plugin" : "Reset plugin"
+              tooltipText: "Reset toggles and settings to defaults"
+              leftAlign: true
+              Layout.fillWidth: true
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(5)
+              foreground: root.resetArmed ? Color.urgent : root.contentForeground
+              accent: root.resetArmed ? Color.urgent : Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: {
+                if (root.resetArmed) {
+                  overflowMenu.close()
+                  root.resetPlugin()
+                } else {
+                  root.resetPlugin()  // arms the confirm; the menu stays open
+                }
+              }
+            }
+          }
+        }
       }
 
       // ---- backends --------------------------------------------------------

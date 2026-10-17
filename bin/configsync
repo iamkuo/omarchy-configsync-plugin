@@ -32,6 +32,7 @@ import socket
 import subprocess
 import sys
 import time
+import fcntl
 from pathlib import Path
 
 HOME = Path.home()
@@ -44,6 +45,39 @@ GDRIVE_STORE = DATA_DIR / "gdrive"
 # Omarchy settings path, so it travels with the rest of the config.
 MANIFEST = HOME / ".config/omarchy/configsync/software.json"
 PLUGIN_DIR = HOME / ".config/omarchy/plugins"
+LOCK_FILE = DATA_DIR / "lock"
+
+
+class OperationLock:
+    """Non-blocking flock so two operations can never overlap.
+
+    A second invocation raises RuntimeError("another operation is running"),
+    which the CLI catches and reports. Auto-sync simply skips that cycle.
+    """
+
+    def __init__(self):
+        self.fd = None
+
+    def __enter__(self):
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(str(LOCK_FILE), os.O_RDWR | os.O_CREAT)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            self.fd = None
+            raise RuntimeError("another operation is running")
+        return self
+
+    def __exit__(self, *args):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
 
 VERSION = 1
 
@@ -770,10 +804,11 @@ def gdrive_sync(state, selected=None, dry=False):
 # --- commands --------------------------------------------------------------
 
 def cmd_scan(args):
-    state = load_state()
-    added = merge_detected(state)
-    save_state(state)
-    print(f"detected {len(state['apps'])} apps ({added} new/changed)")
+    with OperationLock() as lock:
+        state = load_state()
+        added = merge_detected(state)
+        save_state(state)
+        print(f"detected {len(state['apps'])} apps ({added} new/changed)")
 
 
 def cmd_state(args):
@@ -861,24 +896,25 @@ def cmd_set_all(args):
 
 
 def cmd_sync(args):
-    state = load_state()
-    selected = set(args.ids) if args.ids else None
-    messages = []
-    ok = True
-    try:
-        # Refresh the software manifest first so this same sync carries it.
-        if not args.dry_run:
-            capture_software()
-        if not args.only or args.only == "git":
-            _, msg = git_sync(state, selected, dry=args.dry_run)
-            messages.append(msg)
-        if not args.only or args.only == "gdrive":
-            _, msg = gdrive_sync(state, selected, dry=args.dry_run)
-            messages.append(msg)
-    except Exception as exc:  # noqa: BLE001 — report, never crash the shell
-        ok = False
-        messages.append(str(exc).splitlines()[0])
-    _record(state, ok, "; ".join(messages))
+    with OperationLock() as lock:
+        state = load_state()
+        selected = set(args.ids) if args.ids else None
+        messages = []
+        ok = True
+        try:
+            # Refresh the software manifest first so this same sync carries it.
+            if not args.dry_run:
+                capture_software()
+            if not args.only or args.only == "git":
+                _, msg = git_sync(state, selected, dry=args.dry_run)
+                messages.append(msg)
+            if not args.only or args.only == "gdrive":
+                _, msg = gdrive_sync(state, selected, dry=args.dry_run)
+                messages.append(msg)
+        except Exception as exc:  # noqa: BLE001 — report, never crash the shell
+            ok = False
+            messages.append(str(exc).splitlines()[0])
+        _record(state, ok, "; ".join(messages))
 
 
 def _record(state, ok, message):
@@ -897,84 +933,91 @@ def _record(state, ok, message):
 
 
 def cmd_download(args):
-    state = load_state()
-    selected = set(args.ids) if args.ids else None
-    try:
-        _record(state, True, download(state, selected, dry=args.dry_run))
-    except Exception as exc:  # noqa: BLE001
-        _record(state, False, str(exc).splitlines()[0])
+    with OperationLock() as lock:
+        state = load_state()
+        selected = set(args.ids) if args.ids else None
+        try:
+            _record(state, True, download(state, selected, dry=args.dry_run))
+        except Exception as exc:  # noqa: BLE001
+            _record(state, False, str(exc).splitlines()[0])
 
 
 def cmd_deploy(args):
-    state = load_state()
-    selected = set(args.ids) if args.ids else None
-    try:
-        _record(state, True, deploy(state, selected, dry=args.dry_run))
-    except Exception as exc:  # noqa: BLE001
-        _record(state, False, str(exc).splitlines()[0])
+    with OperationLock() as lock:
+        state = load_state()
+        selected = set(args.ids) if args.ids else None
+        try:
+            _record(state, True, deploy(state, selected, dry=args.dry_run))
+        except Exception as exc:  # noqa: BLE001
+            _record(state, False, str(exc).splitlines()[0])
 
 
 def cmd_capture_software(args):
-    manifest = capture_software()
-    print(f"captured {len(manifest['plugins'])} plugin(s) and "
-          f"{len(manifest['packages']['native'])} + {len(manifest['packages']['aur'])} package(s)")
+    with OperationLock() as lock:
+        manifest = capture_software()
+        print(f"captured {len(manifest['plugins'])} plugin(s) and "
+              f"{len(manifest['packages']['native'])} + {len(manifest['packages']['aur'])} package(s)")
 
 
 def cmd_install_software(args):
-    state = load_state()
-    try:
-        _record(state, True, install_software(dry=args.dry_run))
-    except Exception as exc:  # noqa: BLE001
-        _record(state, False, str(exc).splitlines()[0])
+    with OperationLock() as lock:
+        state = load_state()
+        try:
+            _record(state, True, install_software(dry=args.dry_run))
+        except Exception as exc:  # noqa: BLE001
+            _record(state, False, str(exc).splitlines()[0])
 
 
 def cmd_reset(args):
-    state = default_state()
-    merge_detected(state)
-    save_state(state)
-    if args.purge:
-        shutil.rmtree(GIT_DIR, ignore_errors=True)
-        shutil.rmtree(GDRIVE_STORE, ignore_errors=True)
+    with OperationLock() as lock:
+        state = default_state()
+        merge_detected(state)
+        save_state(state)
+        if args.purge:
+            shutil.rmtree(GIT_DIR, ignore_errors=True)
+            shutil.rmtree(GDRIVE_STORE, ignore_errors=True)
     print("reset" + (" and purged local data" if args.purge else ""))
 
 
 def cmd_add(args):
-    state = load_state()
-    target = expand(args.path)
-    if not target.exists():
-        sys.exit(f"no such file or folder: {args.path}")
-    if not target.is_relative_to(HOME):
-        sys.exit("only paths inside your home directory can be synced")
-    rel = home_rel(target)
-    if is_secret(rel):
-        sys.exit("refusing to sync a credentials path")
-    cid = args.id or ("custom-" + rel.strip("/").replace("/", "-"))
-    state["apps"][cid] = {
-        "name": args.name or rel,
-        "kind": "custom",
-        "paths": [to_tilde(target)],
-        "target": args.target,
-        "enabled": True,
-        "risky": False,
-        "note": "added by you",
-    }
-    save_state(state)
-    print(f"added {cid}")
+    with OperationLock() as lock:
+        state = load_state()
+        target = expand(args.path)
+        if not target.exists():
+            sys.exit(f"no such file or folder: {args.path}")
+        if not target.is_relative_to(HOME):
+            sys.exit("only paths inside your home directory can be synced")
+        rel = home_rel(target)
+        if is_secret(rel):
+            sys.exit("refusing to sync a credentials path")
+        cid = args.id or ("custom-" + rel.strip("/").replace("/", "-"))
+        state["apps"][cid] = {
+            "name": args.name or rel,
+            "kind": "custom",
+            "paths": [to_tilde(target)],
+            "target": args.target,
+            "enabled": True,
+            "risky": False,
+            "note": "added by you",
+        }
+        save_state(state)
+        print(f"added {cid}")
 
 
 def cmd_remove(args):
-    state = load_state()
-    if args.id not in state["apps"]:
-        sys.exit(f"unknown app: {args.id}")
-    # A hand-added path is deleted outright; a detected one is remembered as
-    # hidden so the next scan does not put it straight back.
-    if state["apps"][args.id].get("kind") != "custom":
-        hidden = set(state.get("hidden", []))
-        hidden.add(args.id)
-        state["hidden"] = sorted(hidden)
-    del state["apps"][args.id]
-    save_state(state)
-    print("removed")
+    with OperationLock() as lock:
+        state = load_state()
+        if args.id not in state["apps"]:
+            sys.exit(f"unknown app: {args.id}")
+        # A hand-added path is deleted outright; a detected one is remembered
+        # as hidden so the next scan does not put it straight back.
+        if state["apps"][args.id].get("kind") != "custom":
+            hidden = set(state.get("hidden", []))
+            hidden.add(args.id)
+            state["hidden"] = sorted(hidden)
+        del state["apps"][args.id]
+        save_state(state)
+        print("removed")
 
 
 def cmd_status(args):
