@@ -5,193 +5,231 @@ config in your home directory, and syncs the ones you choose across machines.
 
 - **Detect** — walks `~/.config`, the usual shell/editor dotfiles, and Omarchy's
   own settings, then lists them with a switch each.
-- **Choose a backend per app** — small configs go through a **git repo**;
+- **Choose a backend per item** — small configs go through a **git repo**;
   large or personal trees go through **rsync** to a **Google Drive** folder.
-- **Automatic** — turn on Auto and the background service syncs on an interval
-  and once shortly after login.
-- **Safe by default** — credentials, keys, sessions and caches are never
-  detected, and browser/editor profiles start switched off.
+- **Watched** — one switch turns on a watcher: inotify notices a local edit and
+  rsync copies it across a few seconds after you stop typing, with a slower
+  periodic pass for changes made on other machines.
+- **Nothing is lost** — a file edited on two machines keeps **both** versions, a
+  file removed on one machine is only removed elsewhere when nothing changed
+  there, and it goes to a **trash folder** you can restore from.
+- **Secrets stay put** — credentials, keys and sessions are never detected, and
+  browser/editor profiles start switched off.
 
 It is a bar widget plus a headless service, backed by a scriptable CLI.
+
+## Install
+
+```bash
+omarchy plugin validate ~/.config/omarchy/plugins/omarchy-configsync-plugin
+omarchy plugin add ~/.config/omarchy/plugins/omarchy-configsync-plugin --enable bar-widget
+```
+
+`omarchy plugin add` validates the manifest the same way. The watcher needs two
+small packages, and the backends need their tools:
+
+```bash
+sudo pacman -S --needed rsync inotify-tools git python
+```
+
+Then set the two backends once (`configsync set-backend ...`, below) and press
+**Sync now**.
 
 ## The panel
 
 `Super+Space` → search "Config Sync", or click the sync icon on the bar.
 
-The popup imitates Omaplug's layout: a title header with the item count, the two
-backend fields, then **three subtabs** — **Apps**, **Folders** and **Repos** —
-each a
-single-column list of compact cards. Every card has a colour tile, the name and
-path, a **Git/Drive** picker, a remove `✕`, and the on/off switch. Splitting the
-two keeps configs out of the way when you are managing personal folders, and
-vice versa.
-
 ```
-┌ ⣿  CONFIG SYNC          ⟳ Sync now ⋯ ┐
-│   47 items · 35 syncing              │
-│ GIT REPO           DRIVE FOLDER      │
-│ [git@github.com…] [~/Drive/…      ]  │
-│ ( Apps · 46 ) ( Folders · 1 )        │
-│ ⬒ Alacritty  ~/.config/alacritty     │
-│      [Git][Drive]  ✕          [ on ] │
-│ ⚠ Chromium  Browser profile          │
-│                        ✕     [ off ] │
-│ …                                    │
-│ git: 33 up to date            Auto[ ]│
-└──────────────────────────────────────┘
+┌ ⣿  CONFIG SYNC           ⟳ Sync now  ⋯ ┐
+│   47 items · 35 syncing               │
+│ Git github.com:you/dotfiles · Drive … │
+│ ( Items · 47 ) ( Repos · 12 )         │
+│ ⬒ Alacritty  ~/.config/alacritty      │
+│      [Git][Drive]  ✕          [ on ]  │
+│ ⚠ Chromium  Browser profile           │
+│                        ✕     [ off ]  │
+│ …                                     │
+│ 4 sent · 1 received · 2 conflict c…   │
+│ Watch for changes              [ on ] │
+└───────────────────────────────────────┘
 ```
 
-The **switch** decides whether an item syncs at all — turning sync off is the
-switch, never a cycling button. The **Git/Drive picker** next to it only chooses
-where:
+Everything that can sync is one list, enabled items first. Each row has a tile,
+the name and path, a **Git/Drive** picker, a remove `✕`, and the on/off switch.
+The switch decides whether the item syncs at all; the picker only decides where:
 
 | Target | What happens |
 |--------|--------------|
-| **Git** | Versioned in a git working tree; push/pull across machines |
-| **Drive** | Mirrored with `rsync` into your Drive folder; newer file wins |
+| **Git** | Versioned in a git working tree; pushed and pulled across machines |
+| **Drive** | Mirrored with `rsync` into your Drive folder, reconciled both ways |
 
 The `✕` removes a row: a folder you added is deleted outright, and a detected
 app is remembered as hidden so the next scan does not put it straight back
-(the **Reset plugin** item brings everything back).
+(**Reset plugin** in the `⋯` menu brings everything back).
 
-The header has **⟳** (rescan), **Sync now** (capture, push and apply), and a
-**⋯** menu with the less-used actions: **Download** (pull the backends into the
-local store), **Deploy** (write the store into `$HOME`), **Reinstall software**
-(plugins + packages), **Rescan apps**, and **Reset plugin** (click twice to
-confirm). Keeping one primary action means you cannot press the wrong
-push/pull button, and every operation takes a lock so two can never run at
-once. The Folders tab has a field to **add your own folder or file**.
+The `⋯` menu holds the rare actions: **Rescan apps**, **Reinstall software**
+(shows the plan before anything is installed) and **Reset plugin** (press twice).
+The backend fields collapse to one dim line once both are set, and expand when
+you press **Backends**.
 
+### What is not in the GUI
 
+Deliberate, because each one is a way to lose work by pressing the wrong thing:
 
-## What gets detected
+- **Download / Deploy** are still available as `configsync download` and
+  `configsync deploy`, but they are not buttons. `sync` already does both sides
+  in the right order.
+- **Turning deletion propagation on** is
+  `configsync set-backend gdrive delete true`. It is a preference about how
+  destructive the tool may be, not an everyday action, and it is off by default.
+- **Emptying the trash** is `configsync trash empty`.
 
-- **App configs** — every directory under `~/.config` that holds user config.
-- **Home dotfiles** — `.bashrc`, `.zshrc`, `.profile`, `.gitconfig`,
-  `.tmux.conf`, `.XCompose`, `.inputrc`, `.vimrc` and friends.
-- **Omarchy settings** — `~/.config/hypr` and `~/.config/omarchy`
-  (`shell.json`, extensions, hooks, themes, branding; `plugins/` is skipped
-  because those are git-managed already).
-- **Personal folders** — `Documents`, `Pictures`, `Music`, `Videos`, `Desktop`
-  and `Downloads` (the non-empty ones). These are not config, so they default
-  to the **Google Drive** backend, on, and live on the Folders tab.
+## The watcher
 
-### What is deliberately left out
-
-- **Secrets** — `.ssh`, `.gnupg`, `.netrc`, `.config/gh`, `.config/gcloud`,
-  Bitwarden, keyrings, `.aws`, `.docker`, `~/.config/pulse`, and more. These are
-  never even listed.
-- **Machine state** — `systemd`, `dconf`, `procps`, caches, logs, lock files,
-  `plugins/`, `node_modules`.
-- **Risky profiles start off** — browsers, VS Code, Obsidian, Proton, opencode
-  are detected and flagged with `⚠`, but their switch begins off, because they
-  hold cookies, sessions or tokens that a fresh machine is not really
-  "restoring".
-
-## Backends in detail
-
-### Git repo
-
-The repo is a normal working tree at
-`~/.local/share/omarchy-configsync/git/`, whose `home/` subtree mirrors `$HOME`.
-A sync:
-
-1. copies each enabled app's paths into `home/` (with the standard excludes),
-2. commits,
-3. fetches and rebases onto the remote branch,
-4. pushes,
-5. copies the merged result back into `$HOME`.
-
-If the same file changed on two machines, the rebase stops and the panel shows
-an error; resolve it in the repo and sync again. Running the sync on the other
-machine first — or committing there and syncing here — avoids the clash.
-
-Set the remote once:
+One switch, in the panel footer:
 
 ```bash
-configsync set-backend git remote git@github.com:you/dotfiles.git
-configsync set-backend git branch main
+configsync set-backend watch enabled true
+configsync set-backend watch debounce 4      # seconds of quiet before pushing
+configsync set-backend watch pull 10         # minutes between full passes
 ```
 
-### Google Drive
+When Watch is on:
 
-Set the folder your Drive client mounts or syncs:
+- **inotify** watches every enabled path. Local changes are collected and pushed
+  a few seconds (default 4) after the last one, so a save storm becomes one rsync
+  pass.
+- A **full pass** runs every `pull` minutes (default 10) and once at login. This
+  is what brings back changes made on other machines — inotify cannot see those,
+  so the two mechanisms work together.
+- The slower pass is also what pushes anything the fast path deferred, such as a
+  deletion (which needs the three-way comparison, not a single file).
+
+The watcher runs as a **systemd user service** (`configsync-watch.service`,
+installed by `configsync service install`). That is how it survives a shell
+restart, and it is the only way it keeps working when no shell is running. With
+no user session bus available it falls back to a child process inside the shell
+service, and a lock file guarantees the two can never both be working.
 
 ```bash
-configsync set-backend gdrive remote ~/Drive/omarchy-configsync
+configsync service status     # installed? enabled? active? plus the unit's state
+configsync service install    # write and start the systemd user unit
+configsync service uninstall
+configsync watch              # run a watcher in the foreground (Ctrl+C to stop)
+configsync watch --once       # one full pass, useful in scripts and timers
 ```
 
-Each path is reconciled both ways with `rsync -a --update`, so the newer copy
-wins. Turn on deletion propagation with
-`configsync set-backend gdrive delete true` if you want removed files removed
-remotely too (off by default, because it is destructive).
+## What happens when both machines change the same file
 
-## Auto sync
+The reconciler compares three things per file: your copy, the backend's copy, and
+a **baseline** recorded after the last successful pass. That is what makes
+"changed here" and "changed there" distinguishable rather than guessed at:
 
-The **Auto sync** switch in the panel footer, or:
+| Local | Backend | Result |
+|-------|---------|--------|
+| changed | untouched | pushed |
+| untouched | changed | pulled |
+| changed | changed | **both kept**: your copy stays in place, the backend's version is written next to it as `name.conflict-<host>-<date>` and pushed, so the other machine can see what it lost |
+| removed | untouched | removed from the backend too — into the trash, not unlinked |
+| removed | changed | **not** propagated; the backend's version stays |
+| new | — | pushed |
+| — | new | pulled |
 
-```bash
-configsync set-backend auto enabled true
-configsync set-backend auto interval 30      # minutes
-```
+Removals only ever move a file into
+`~/.local/share/omarchy-configsync/trash/`, and `configsync trash list`,
+`trash restore` and `trash empty` work on it. Restoring never overwrites a file
+that reappeared in the meantime; it keeps both.
 
-When Auto is on, a slider appears beside the switch to set the interval
-(5–180 minutes) without leaving the panel. The service watches the state file
-and runs `configsync sync` on that interval, plus one catch-up sync ~45s after
-the shell starts.
+The first sync on a machine with no baseline is the one case with no history to
+compare against: the backend holds the setup being restored, so it wins, and
+every local file that differed is kept under
+`~/.local/share/omarchy-configsync/conflicts/first-sync-<date>/`. Run it with
+`--dry-run` first, or `--prefer local` to push instead of pull.
+
+## Requirements and limits
+
+- **Backends are not authenticated by this plugin.** The Drive backend assumes
+  the folder is already mounted or synced locally (`rclone`, a Drive client, a
+  systemd mount). The git backend assumes you can already push to the remote.
+- **Fingerprints are size + timestamp**, like rsync's default check. When a file
+  is the same size and the timestamps cannot settle it, the two sides are
+  compared by content before anything is called "identical" — but a file edited
+  on one machine, with its timestamps faked back, is invisible to any tool that
+  does not read every file on every pass. `configsync sync --dry-run` reports
+  what would move.
+- **The git backend is not a merge tool.** A two-sided edit is kept (see the
+  table) and the loser is committed beside the winner, so the repository is
+  linear. A genuine git conflict on the *store* itself (a machine pushing
+  history that diverged) stops the pass with an error instead of guessing.
+- **The Drive backend tolerates timestamp rounding** (2 seconds), because FUSE
+  and network mounts round them. A same-size edit is then noticed as soon as the
+  stamp drifts past that window, not lost.
+- **The watcher falls back to polling** (`configsync state` shows
+  `"mode": "poll"`) if inotify watches cannot be added, and does a full pass
+  every `pull` minutes either way.
+- **Nothing is encrypted by this plugin.** Your configs go to your git host and
+  your Drive folder, where they are readable by whoever can read those. Use a
+  private repository.
 
 ## Plugins and software
 
-Config Sync restores more than files. Every `sync` also writes a **software
-manifest** — the third-party Omarchy plugins you have (with their git source),
-and the packages you installed on top of Arch — to
-`~/.config/omarchy/configsync/software.json`, which travels with the rest of
-the config.
+Every `sync` also writes a **software manifest** — the third-party Omarchy
+plugins you have (with their git source) and the packages you installed on top of
+Arch — to `~/.config/omarchy/configsync/software.json`, which travels with the
+rest of the config.
 
-On a fresh machine, the **package** button (or `configsync install-software`)
-puts them back:
+Reinstalling is always shown as a **plan first**, in the panel and on the CLI:
 
-- **Plugins** clone straight from their recorded git URL with
-  `omarchy plugin add <url> --yes --enable` — the ones you had enabled come back
-  enabled.
-- **Packages** are diffed against what's installed, and the missing ones are
-  installed with `omarchy pkg add` / `omarchy pkg aur add`. This needs a
-  password, so it opens a terminal to run in.
+```bash
+configsync install-software           # print what is missing
+configsync install-software --yes     # do it
+```
 
-So a new machine is: install the plugin → set both backends → **Download** →
-**Deploy** → **install software**.
+- **Plugins** are cloned from their recorded git URL with
+  `omarchy plugin add <url> --yes --enable`.
+- **Packages** are diffed against what is installed and added with
+  `omarchy pkg add` / `omarchy pkg aur add`, which opens a terminal because it
+  needs a password.
 
+The manifest is data that came off another machine, so names are validated
+against a strict pattern before use (a plugin source may not start with `-`, a
+package name may not contain `;`, `$`, spaces or a slash) and anything odd is
+listed as refused instead of passed to a shell.
 
 ## CLI
 
 Everything the panel does is a command, so it works over SSH too:
 
 ```bash
-configsync scan                      # detect apps and folders, merge into state
-configsync state                     # whole state as JSON
-configsync status                    # last sync result
+configsync scan                        # detect apps and folders, merge into state
+configsync state                       # whole state as JSON
+configsync status                      # last sync result, notes and conflict paths
 configsync set-enabled <id> true|false
 configsync set-target  <id> git|gdrive|none
-configsync set-all true|false
-configsync sync [--only git|gdrive] [--dry-run] [id ...]
-configsync download                  # pull the backends into the local store
-configsync deploy                    # write the local store into $HOME
+configsync set-secrets <id> true|false
+configsync sync [--only git|gdrive] [--dry-run] [--prefer local|remote] [id ...]
+configsync watch [--once] [--force]
+configsync service status|install|uninstall
 configsync add <path> [--name N] [--target git|gdrive]
-configsync remove <id>               # delete a custom path, or hide a detected one
-configsync capture-software          # record plugins + packages into the manifest
-configsync install-software          # reinstall missing plugins + packages
-configsync repos                     # list git repositories on the machine
-configsync reset [--purge]           # reset state (--purge also deletes local repos)
+configsync remove <id>                 # delete a custom path, or hide a detected one
+configsync trash list|restore|restore-all|empty
+configsync capture-software            # record plugins + packages into the manifest
+configsync install-software [--plan|--yes]
+configsync repos                       # list git repositories on the machine
+configsync reset [--purge]             # reset state (--purge also deletes local repos)
 ```
 
 `id` is the item key shown in `configsync state` (e.g. `ghostty`, `bashrc`,
 `hyprland`, `personal-Pictures`, `custom-Documents-notes`).
 
+Unrecognised flags are an error, not something ignored: `configsync --delete`
+stops with a message pointing at the replacement.
+
 ### Keyboard
 
 While the popup is focused: **Page Up / Page Down** scroll the list,
 **Up/Down** scroll a little, **Home/End** jump to the ends, and **Tab** flips
-between the Apps, Folders and Repos subtabs. **Escape** closes.
+between the Items and Repos tabs. **Escape** closes.
 
 ## Repositories
 
@@ -200,35 +238,48 @@ machine: every clone under `$HOME` (including the Omarchy plugin checkouts and
 the sync backend itself), with its branch, whether it has uncommitted changes,
 how far ahead/behind its upstream it is, and its origin URL.
 
-Scanning is depth-limited and skips caches, `node_modules`, app profiles, and
-any mounted filesystem (so the Google Drive mount is never walked). It takes
-well under a second. **Refresh** rescans; it also runs when the tab is opened.
-
-```bash
-configsync repos                     # JSON inventory (same data the tab shows)
-```
-
+Scanning is depth-limited and skips caches, `node_modules`, app profiles, and any
+mounted filesystem (so the Google Drive mount is never walked). It takes well
+under a second. **Refresh** rescans; it also runs when the tab is opened.
 
 ## Files
 
 | Path | Purpose |
 |------|---------|
 | `BarWidget.qml` | The bar button; loads the popup and forwards open/close |
-| `Panel.qml` | The popup: header, backend fields, subtabs, list, footer |
-| `panel/AppCell.qml` | One row in the list |
+| `Panel.qml` | The popup: header, backends, tabs, list, footer |
+| `panel/AppCell.qml` | One row in the item list |
+| `panel/RepoCell.qml` | One row in the repos list |
 | `panel/Presentation.js` | Tile colours and backend labels |
-| `Service.qml` | Background Auto sync |
-| `bin/configsync` | The CLI and the sync engines |
-| `~/.config/omarchy/configsync.json` | Which apps sync, where, and the last result |
-| `~/.config/omarchy/configsync/software.json` | The plugin + package manifest, synced with the config |
+| `Service.qml` | Keeps a watcher alive when there is no systemd user service |
+| `bin/configsync` | The CLI: reconciler, watcher, service, software manifest |
+| `tests/test_configsync.py` | End-to-end tests over two fake machines |
+| `docs/SAFETY.md` | What the plugin is allowed to touch, and why |
+
+| Runtime state | Purpose |
+|---------------|---------|
+| `~/.config/omarchy/configsync.json` | Which items sync, where, and the last result |
+| `~/.config/omarchy/configsync/software.json` | Plugin + package manifest, synced with the config |
 | `~/.local/share/omarchy-configsync/git/` | The git backend working tree |
+| `~/.local/share/omarchy-configsync/baseline/` | Per-pair fingerprints from the last pass |
+| `~/.local/share/omarchy-configsync/trash/` | Files a sync removed, with an index |
+| `~/.local/share/omarchy-configsync/conflicts/` | Local copies a first sync kept aside |
 
-## Limits
+## Tests
 
-- The git backend is "push wins with conflicts surfaced", not a full merge
-  tool; a genuine two-sided edit is reported rather than guessed at.
-- The Drive backend assumes the folder is already mounted/synced locally; it
-  does no authenticating of its own (use `rclone`, a Drive client, or a
-  systemd mount).
-- Auto sync is best-effort inside the shell session; it does not run while no
-  session is active.
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+They build two throwaway machines with their own `$HOME`, a bare git remote and
+a folder standing in for a Drive mount, then drive the real CLI as a subprocess:
+first sync, both-sides edits, deletions, trash restore, secret skipping,
+symlinked folders, the software-plan validation, and the watcher actually
+pushing a file it noticed.
+
+## Upgrading from 0.1.0
+
+Run `configsync scan` once. The interval **Auto sync** setting is migrated to the
+watcher, and the old flag forms (`sync --download`, `set-gdrive`, `set-git`,
+`set-auto`, `panel-state`, `--delete`, …) were replaced by the subcommands above;
+using one prints the replacement.

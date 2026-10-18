@@ -6,8 +6,19 @@ Two backends, chosen per app:
   git     small configs, versioned in a git repo (default)
   gdrive  large/personal trees, mirrored with rsync to a Google Drive folder
 
-The plugin's window and service drive this CLI; everything it prints is either
-human text or a single JSON document, so it stays scriptable on its own.
+Both backends run the same reconciler: a three-way comparison between the local
+tree, the backend's copy, and a baseline recorded after the last successful
+pass. A file that changed on one side is copied to the other. A file that
+changed on both sides is never silently overwritten — the version that loses is
+written next to the winner as `<name>.conflict-<host>-<date>`. A deletion only
+propagates when the other side is unchanged, and deleted files are moved to a
+trash folder instead of being unlinked (`configsync trash` restores them).
+
+`configsync watch` keeps inotify watches on the enabled paths and pushes local
+edits a few seconds after they stop changing, with a slower periodic pass that
+pulls changes made on other machines — inotify cannot see those, so the two work
+together. The watcher runs as a systemd user service when one is available, and
+inside the shell otherwise.
 
 State (which apps are on, and where each one goes) lives in one file:
 
@@ -17,22 +28,37 @@ The git backend keeps a working repo whose `home/` subtree mirrors $HOME:
 
   ~/.local/share/omarchy-configsync/git/home/...
 
+Everything else this tool writes lives beside it:
+
+  baseline/    last-synced fingerprints, one file per app
+  trash/       files a sync removed, restorable with `configsync trash`
+  conflicts/   first-sync copies of files that lost to the backend
+  watch.json   live watcher status, read by the panel
+
 Only config-shaped files are ever considered. Credentials, keys, sessions and
-caches are excluded on purpose (see SECRETS / SKIP_CONFIG / RISKY / EXCLUDES).
+caches are excluded on purpose (see SECRETS / SECRET_FILES / SKIP_CONFIG /
+RISKY / EXCLUDES).
 """
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import fnmatch
+import fcntl
 import json
 import os
+import re
+import select
 import shlex
 import shutil
+import hashlib
+import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
-import fcntl
 from pathlib import Path
 
 HOME = Path.home()
@@ -41,18 +67,41 @@ DATA_DIR = HOME / ".local/share/omarchy-configsync"
 GIT_DIR = DATA_DIR / "git"
 STORE = GIT_DIR / "home"
 GDRIVE_STORE = DATA_DIR / "gdrive"
+BASELINE_DIR = DATA_DIR / "baseline"
+TRASH_DIR = DATA_DIR / "trash"
+CONFLICTS_DIR = DATA_DIR / "conflicts"
+WATCH_STATUS = DATA_DIR / "watch.json"
+WATCH_LOCK = DATA_DIR / "watch.lock"
+LOCK_FILE = DATA_DIR / "lock"
 # Manifest of what to reinstall on a fresh machine. It lives under the synced
 # Omarchy settings path, so it travels with the rest of the config.
 MANIFEST = HOME / ".config/omarchy/configsync/software.json"
 PLUGIN_DIR = HOME / ".config/omarchy/plugins"
-LOCK_FILE = DATA_DIR / "lock"
+UNIT_DIR = HOME / ".config/systemd/user"
+UNIT_NAME = "configsync-watch.service"
+
+# Bumped to 2: `watch` replaces the interval `auto` timer.
+VERSION = 2
+# Timestamps are compared in nanoseconds, with a tolerance per side. A local
+# filesystem keeps them exact, so a local file counts as unchanged only when its
+# stamp is identical. The git store is also a plain local directory — git only
+# rewrites files whose content changed — so it is compared exactly too. A
+# mounted drive, though, may round stamps to the second, so it gets slack; a
+# change is then noticed as soon as the stamp drifts past that window.
+LOCAL_TOLERANCE = 0
+DRIVE_TOLERANCE = 2_000_000_000
+
+
+def backend_tolerance(app: dict) -> int:
+    """How exact the backend side of this app has to be."""
+    return LOCAL_TOLERANCE if app.get("target") == "git" else DRIVE_TOLERANCE
 
 
 class OperationLock:
     """Non-blocking flock so two operations can never overlap.
 
     A second invocation raises RuntimeError("another operation is running"),
-    which the CLI catches and reports. Auto-sync simply skips that cycle.
+    which the CLI catches and reports. The watcher simply skips that cycle.
     """
 
     def __init__(self):
@@ -79,7 +128,24 @@ class OperationLock:
             self.fd = None
 
 
-VERSION = 1
+def lock_held(path: Path) -> bool:
+    """True when some other process holds an exclusive flock on `path`."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return False
+
 
 # --- Classification --------------------------------------------------------
 
@@ -88,7 +154,7 @@ SECRETS = [
     ".ssh", ".gnupg", ".netrc", ".authinfo", ".authinfo.gpg",
     ".config/gh", ".config/gcloud", ".config/sops", ".config/age",
     ".config/Bitwarden", ".config/Bitwarden CLI", ".config/1Password",
-    ".local/share/keyrings", ".config/pulse", ".aws", ".docker",
+    ".config/op", ".local/share/keyrings", ".config/pulse", ".aws", ".docker",
     ".config/rustup", ".config/go", ".password-store",
 ]
 
@@ -127,12 +193,16 @@ DOTFILES = {
     ".wgetrc": "Wget config", ".curlrc": "curl config", ".nanorc": "Nano config",
 }
 
-# Omarchy's own settings, offered as first-class groups.
+# Omarchy's own settings, offered as first-class groups. `configsync.json` is
+# this tool's own machine-local state (remotes, toggles, last result) and must
+# not travel: two machines would otherwise overwrite each other's choices. The
+# software manifest next to it (`configsync/software.json`) is meant to travel,
+# and the anchored exclude leaves it alone.
 OMARCHY = [
     {"id": "hyprland", "name": "Hyprland", "paths": ["~/.config/hypr"],
      "exclude": []},
     {"id": "omarchy", "name": "Omarchy settings", "paths": ["~/.config/omarchy"],
-     "exclude": ["plugins"]},
+     "exclude": ["plugins", "configsync.json"]},
 ]
 OMARCHY_IDS = {group["id"] for group in OMARCHY}
 # Config dirs that the Omarchy groups already cover; don't offer them twice.
@@ -158,8 +228,20 @@ EXCLUDES = [
     "blob_storage", "File System", "Sync Data", "History", "Top Sites",
     "Visited Links", "TransportSecurity", "Network Persistent State",
     "*.lock", "*.log", "*.tmp", "*.tmp.*", "logs", ".git", "node_modules",
-    "__pycache__", "*.pyc", "credentials", "*.credentials", ".git-credentials",
-    ".netrc", "known_hosts",
+    "__pycache__", "*.pyc",
+]
+
+# Key, token and vault files that are never copied, anywhere, even out of a
+# folder you added yourself: the cost of skipping one is small, the cost of
+# pushing a private key to a git host or a cloud folder is not. An item can opt
+# out with `configsync set-secrets <id> true`.
+SECRET_FILES = [
+    ".netrc", ".authinfo", ".authinfo.gpg", ".git-credentials", "known_hosts",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ed25519_sk", "*.pem",
+    "*.key", "*.ppk", "*.pfx", "*.p12", "*.kdbx", "*.jks", "*.keystore",
+    ".env", ".env.*", "credentials", "*.credentials", "credentials.json",
+    "token.json", "tokens.json", "*.token", "service-account*.json",
+    "*.ovpn", ".htpasswd",
 ]
 
 # Pretty names for common config dirs; anything else is titled-cased.
@@ -173,6 +255,12 @@ PRETTY = {
     "xournalpp": "Xournal++", "imv": "imv", "nautilus": "Files",
 }
 
+# Package and plugin-source validation for `install-software`. The manifest is
+# synced data, so it is untrusted input: nothing from it reaches a shell or
+# pacman unchecked.
+PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}$")
+SOURCE_RE = re.compile(r"^(https://|http://|ssh://|git://|git@)[^\s]+$")
+
 
 # --- small helpers ---------------------------------------------------------
 
@@ -180,15 +268,15 @@ def expand(p) -> Path:
     return Path(os.path.expanduser(str(p)))
 
 
-def to_tilde(p: Path) -> str:
+def to_tilde(p) -> str:
     s = str(p)
     home = str(HOME)
     return "~" + s[len(home):] if s == home or s.startswith(home + "/") else s
 
 
-def run(cmd, cwd=None, check=True, env=None):
+def run(cmd, cwd=None, check=True, env=None, timeout=None):
     proc = subprocess.run(
-        cmd, cwd=cwd, env=env, text=True,
+        cmd, cwd=cwd, env=env, text=True, timeout=timeout,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     if check and proc.returncode != 0:
@@ -200,11 +288,43 @@ def have(binary: str) -> bool:
     return shutil.which(binary) is not None
 
 
+def slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-") or "item"
+
+
+def stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def hostname() -> str:
+    return re.sub(r"[^A-Za-z0-9-]+", "-", socket.gethostname() or "host")
+
+
+def local_root(p: Path) -> Path:
+    """Resolve a top-level symlink so we sync the folder's contents.
+
+    `~/Documents -> /data/Documents` is common, and `rsync -a` would copy the
+    symlink itself, storing a dangling link and no data. Resolving keeps the
+    link in place on both ends: reads and writes go to its target.
+    """
+    try:
+        return p.resolve()
+    except OSError:
+        return p
+
+
+def home_rel(p: Path) -> str:
+    return str(p.relative_to(HOME))
+
+
 def default_state() -> dict:
     return {
         "version": VERSION,
         "git": {"remote": "", "branch": "main"},
         "gdrive": {"remote": "", "delete": False},
+        "watch": {"enabled": False, "debounceSeconds": 4, "pullMinutes": 10},
+        # Kept so an upgrade can migrate a machine that had the old interval
+        # timer switched on; nothing writes it any more.
         "auto": {"enabled": False, "intervalMinutes": 30},
         "apps": {},
         "hidden": [],
@@ -219,19 +339,42 @@ def load_state() -> dict:
             loaded = json.loads(STATE_FILE.read_text())
         except (OSError, json.JSONDecodeError):
             loaded = {}
-        for key in ("version", "git", "gdrive", "auto", "apps", "hidden", "lastSync"):
+        for key in ("version", "git", "gdrive", "watch", "auto", "apps", "hidden",
+                    "lastSync"):
             if key in loaded:
                 if isinstance(state.get(key), dict) and isinstance(loaded[key], dict):
                     state[key].update(loaded[key])
                 else:
                     state[key] = loaded[key]
+        if "watch" not in loaded and loaded.get("auto", {}).get("enabled"):
+            # Migrate: the old interval timer becomes the watcher.
+            state["watch"]["enabled"] = True
+        if int(loaded.get("version", 0) or 0) < VERSION:
+            # Defaults fill in whatever an older file lacks, so the in-memory
+            # state is already the current shape.
+            state["version"] = VERSION
     return state
 
 
 def save_state(state: dict) -> None:
+    """Atomic write that survives a crash mid-write.
+
+    The state file holds the remotes and every toggle, and a truncated file
+    silently reads back as defaults, so it is fsynced before the rename and the
+    previous good copy is kept as `.bak`.
+    """
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n")
+    payload = json.dumps(state, indent=2, sort_keys=False) + "\n"
+    with open(tmp, "w") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    if STATE_FILE.exists():
+        try:
+            shutil.copy2(STATE_FILE, STATE_FILE.with_suffix(".json.bak"))
+        except OSError:
+            pass
     tmp.replace(STATE_FILE)
 
 
@@ -310,6 +453,9 @@ def detect() -> dict:
         # something happens to be in them.
         if not folder.is_dir():
             continue
+        note = "Personal files — defaults to Google Drive."
+        if folder.is_symlink():
+            note = f"Personal files — symlinked to {local_root(folder)}."
         found[f"personal-{dirname}"] = {
             "name": label,
             "kind": "personal",
@@ -317,7 +463,7 @@ def detect() -> dict:
             "target": "gdrive",
             "enabled": True,
             "risky": False,
-            "note": "Personal files — defaults to Google Drive.",
+            "note": note,
         }
 
     return found
@@ -336,6 +482,8 @@ def merge_detected(state: dict) -> int:
             known[cid]["name"] = candidate["name"]
             known[cid]["paths"] = candidate["paths"]
             known[cid]["kind"] = candidate["kind"]
+            if candidate.get("note"):
+                known[cid]["note"] = candidate["note"]
             if "exclude" in candidate:
                 known[cid]["exclude"] = candidate["exclude"]
         else:
@@ -350,132 +498,475 @@ def merge_detected(state: dict) -> int:
     return changed
 
 
-# --- rsync plumbing --------------------------------------------------------
-
-def rsync_filter_args(excludes):
-    args = ["--exclude", "/" + ".*.swp"]
-    for pattern in EXCLUDES:
-        args += ["--exclude", pattern]
-    for pattern in excludes or []:
-        args += ["--exclude", "/" + pattern.strip("/")]
-    return args
-
-
-def rsync(src: Path, dst: Path, excludes, delete=False, update=False) -> None:
-    """Copy one path -> path with the standard excludes. Handles files and dirs."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src_is_dir = src.is_dir()
-    cmd = ["rsync", "-a", "--mkpath"]
-    if delete and src_is_dir:
-        cmd.append("--delete")
-    if update:
-        cmd.append("--update")
-    cmd += rsync_filter_args(excludes)
-    if src_is_dir:
-        cmd += [str(src) + "/", str(dst) + "/"]
-    else:
-        cmd += [str(src), str(dst)]
-    run(cmd)
-
-
-def home_rel(p: Path) -> str:
-    return str(p.relative_to(HOME))
-
-
-def store_root(target: str) -> Path:
-    return GDRIVE_STORE if target == "gdrive" else STORE
-
-
-def ensure_git_repo(state) -> str:
-    if not have("git"):
-        raise RuntimeError("git is not installed")
-    GIT_DIR.mkdir(parents=True, exist_ok=True)
-    if not (GIT_DIR / ".git").exists():
-        run(["git", "init", "-q", "-b", state["git"]["branch"]], cwd=GIT_DIR)
-    run(["git", "config", "user.name", os.environ.get("USER", "configsync")],
-        cwd=GIT_DIR, check=False)
-    run(["git", "config", "user.email", "configsync@localhost"], cwd=GIT_DIR, check=False)
-    remote = state["git"].get("remote", "").strip()
-    if remote:
-        run(["git", "remote", "remove", "origin"], cwd=GIT_DIR, check=False)
-        run(["git", "remote", "add", "origin", remote], cwd=GIT_DIR)
-    return remote
-
-
-# --- download / deploy -----------------------------------------------------
+# --- fingerprints and plans ------------------------------------------------
 #
-# `download` brings the backend's copy into a local store (nothing in $HOME is
-# touched); `deploy` writes the store back into $HOME. Keeping them apart means
-# a fresh machine can pull everything first, look, then deploy — and that a
-# download never silently overwrites a local file.
+# A fingerprint is what we compare between passes:
+#
+#   ("f", size, mtime)   a regular file
+#   ("d",)               a directory
+#   ("l", target)        a symlink (copied as a link, never followed)
+#
+# Comparing fingerprints instead of running rsync blind is what makes the
+# reconciler safe: it can tell which side changed, which side deleted, and when
+# both changed, instead of letting the newer mtime silently win.
 
-def download(state, selected=None, dry=False):
-    messages = []
-    remote = state["git"].get("remote", "").strip()
-    branch = state["git"]["branch"]
-    if not remote:
-        messages.append("git: no remote set")
-    elif dry:
-        messages.append("git: would fetch and reset the store")
+def fingerprint(path: Path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if os.path.islink(str(path)):
+        try:
+            return ("l", os.readlink(str(path)))
+        except OSError:
+            return ("l", "")
+    if os.path.isdir(str(path)):
+        return ("d",)
+    return ("f", st.st_size, int(st.st_mtime_ns))
+
+
+def digest(path: Path) -> str | None:
+    """Content hash, read only when size and time cannot settle identity.
+
+    Timestamps are how the fast path compares files, but they lie on a mounted
+    drive (rounding) and in the git store (a checkout rewrites them). When two
+    files are the same size and the question is "did both sides really end up
+    with the same bytes?", guessing wrong throws away one machine's version, so
+    it is worth reading them.
+    """
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                hasher.update(block)
+    except OSError:
+        return None
+    return hasher.hexdigest()
+
+
+def same(a, b, tolerance: int = DRIVE_TOLERANCE) -> bool:
+    if a is None or b is None:
+        return a is b
+    if a[0] != b[0]:
+        return False
+    if a[0] == "f":
+        return a[1] == b[1] and abs(a[2] - b[2]) <= tolerance
+    return a == b
+
+
+def excluded(rel: str, name: str, patterns) -> bool:
+    for pattern in patterns:
+        if pattern.startswith("/"):
+            anchored = "/" + rel
+            if fnmatch.fnmatch(anchored, pattern) or anchored.startswith(pattern + "/"):
+                return True
+        elif fnmatch.fnmatch(name, pattern):
+            return True
+    return False
+
+
+def is_excluded_path(rel: str, patterns, allow_secrets: bool = False) -> bool:
+    if excluded(rel, Path(rel).name, patterns):
+        return True
+    return not allow_secrets and excluded(rel, Path(rel).name, SECRET_FILES)
+
+
+def scan_dir(root: Path, patterns, allow_secrets: bool = False,
+             max_entries: int = 200000):
+    """Relative path -> fingerprint for everything we are willing to copy."""
+    out: dict[str, tuple] = {}
+    if not root.is_dir():
+        return out
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        rel_dir = str(here.relative_to(root))
+        keep = []
+        for d in dirnames:
+            rel = d if rel_dir == "." else f"{rel_dir}/{d}"
+            if is_excluded_path(rel, patterns, allow_secrets):
+                continue
+            if (here / d).is_symlink():
+                # Never walk into a linked directory: that leaves the synced
+                # tree, and can loop.
+                out[rel] = fingerprint(here / d)
+                continue
+            keep.append(d)
+            out[rel] = ("d",)
+        dirnames[:] = keep
+        if rel_dir != ".":
+            out[rel_dir] = ("d",)
+        for f in filenames:
+            rel = f if rel_dir == "." else f"{rel_dir}/{f}"
+            if is_excluded_path(rel, patterns, allow_secrets):
+                continue
+            fp = fingerprint(here / f)
+            if fp is not None:
+                out[rel] = fp
+        if len(out) > max_entries:
+            raise RuntimeError(
+                f"{to_tilde(root)} has more than {max_entries} entries — "
+                "narrow it down or add excludes")
+    return out
+
+
+def pair_bases(local: Path, remote: Path):
+    """(local base, remote base, is_dir) — how one pair is shaped on disk.
+
+    A directory is its own base, so relative paths inside it are the shared
+    namespace. A single file uses its parent as the base and keeps its name as
+    the relative path — and the shape comes from whichever side exists, so a
+    backend copy that has not been created yet is still treated as a directory
+    when the local side is one.
+    """
+    lfp, rfp = fingerprint(local), fingerprint(remote)
+    if lfp is not None:
+        is_dir = lfp[0] == "d"
+    elif rfp is not None:
+        is_dir = rfp[0] == "d"
     else:
-        ensure_git_repo(state)
-        run(["git", "fetch", "-q", "origin"], cwd=GIT_DIR, check=False)
-        has_remote = run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"],
-                         cwd=GIT_DIR, check=False).returncode == 0
-        if not has_remote:
-            messages.append("git: remote has no commits yet")
+        is_dir = True
+    return (local if is_dir else local.parent,
+            remote if is_dir else remote.parent, is_dir)
+
+
+class Plan:
+    """What a reconcile pass intends to do, before it does anything."""
+
+    def __init__(self):
+        self.push: list[str] = []           # local -> backend
+        self.pull: list[str] = []           # backend -> local
+        self.delete_remote: list[str] = []  # removed here, gone there too
+        self.delete_local: list[str] = []   # removed there, gone here too
+        self.conflicts: list[str] = []      # changed on both sides
+        self.kept: list[str] = []           # deletion not propagated
+        self.same: list[str] = []
+
+
+def make_plan(local: dict, remote: dict, base_local: dict, base_remote: dict,
+              delete: bool, prefer: str | None = None,
+              remote_slack: int = DRIVE_TOLERANCE,
+              content_equal=None) -> Plan:
+    """Three-way compare. `prefer` only decides a no-baseline disagreement."""
+    plan = Plan()
+
+    def identical(rel: str, a, b) -> bool:
+        """Do the two sides hold the same bytes?
+
+        Equal fingerprints say yes for free. Otherwise, same size and a close
+        stamp is not proof, so the contents decide when the caller can read
+        them; if it cannot, the answer is no and both versions are kept.
+        """
+        if a is None or b is None:
+            return a is b
+        if a == b:
+            return True
+        if a[0] != "f" or b[0] != "f" or a[1] != b[1]:
+            return False
+        return bool(content_equal and content_equal(rel))
+
+    for rel in sorted(set(local) | set(remote)):
+        l = local.get(rel)
+        r = remote.get(rel)
+        bl = base_local.get(rel)
+        br = base_remote.get(rel)
+        known = rel in base_local or rel in base_remote
+
+        if l is not None and r is not None:
+            if not known:
+                # First pass for this pair on this machine. The backend holds
+                # the setup being restored, so it wins — and the local version
+                # is preserved rather than dropped.
+                if identical(rel, l, r):
+                    plan.same.append(rel)
+                elif prefer == "local":
+                    plan.push.append(rel)
+                else:
+                    plan.pull.append(rel)
+                    plan.conflicts.append(rel)
+                continue
+            # Compare each side against the baseline, not against each other:
+            # the baseline is the only record of what was true last time.
+            local_changed = bl is None or not same(l, bl, LOCAL_TOLERANCE)
+            remote_changed = br is None or not same(r, br, remote_slack)
+            if local_changed and remote_changed:
+                if identical(rel, l, r):
+                    plan.same.append(rel)     # both sides really hold the same bytes
+                else:
+                    plan.conflicts.append(rel)
+            elif local_changed:
+                plan.push.append(rel)
+            elif remote_changed:
+                plan.pull.append(rel)
+            else:
+                plan.same.append(rel)
+            continue
+
+        if l is not None and r is None:
+            # The backend copy is gone: it was deleted on the other machine.
+            if known and bl is not None and same(l, bl, LOCAL_TOLERANCE):
+                (plan.delete_local if delete else plan.kept).append(rel)
+            else:
+                plan.push.append(rel)
+            continue
+
+        if l is None and r is not None:
+            # The local copy is gone: it was deleted here.
+            if known and br is not None and same(r, br, remote_slack):
+                (plan.delete_remote if delete else plan.kept).append(rel)
+            else:
+                plan.pull.append(rel)
+            continue
+    return plan
+
+
+# --- applying a plan -------------------------------------------------------
+
+def rsync_copy(src_root: Path, dst_root: Path, rels, extra=()) -> None:
+    """Copy the named paths (files, dirs, links) with rsync.
+
+    The list goes over stdin NUL-separated (`--from0`) so names with spaces or
+    newlines cannot be mangled into other paths.
+    """
+    if not rels:
+        return
+    if not have("rsync"):
+        raise RuntimeError("rsync is not installed")
+    dst_root.mkdir(parents=True, exist_ok=True)
+    payload = b"".join(rel.encode("utf-8", "surrogateescape") + b"\0" for rel in rels)
+    # --ignore-times: the decision to copy was already made by comparing
+    # fingerprints, and rsync's own quick check only compares whole seconds. A
+    # same-size edit saved in the same second as the last sync would otherwise
+    # be listed, reported as sent, and never actually copied.
+    cmd = ["rsync", "-a", "--ignore-times", "--mkpath", "--from0", "--files-from=-",
+           *extra, str(src_root) + "/", str(dst_root) + "/"]
+    proc = subprocess.run(cmd, input=payload, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise RuntimeError("rsync failed: " + proc.stdout.decode("utf-8", "replace").strip())
+
+
+def conflict_name(name: str) -> str:
+    p = Path(name)
+    return f"{p.stem}.conflict-{hostname()}-{stamp()}{p.suffix}"
+
+
+def save_conflict_copy(src: Path, dest: Path) -> Path:
+    """Keep the version that is about to lose, next to the winner."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, dest, symlinks=True, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src, dest, follow_symlinks=False)
+    return dest
+
+
+def trash(path: Path, rel: str, side: str, app: str) -> None:
+    """Move a file the sync removed into the trash, with an index entry."""
+    target = TRASH_DIR / stamp() / side / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(path), str(target))
+    except (OSError, shutil.Error):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
         else:
-            before = run(["git", "rev-parse", "HEAD"], cwd=GIT_DIR, check=False).stdout.strip()
-            run(["git", "checkout", "-q", "-f", "-B", branch, f"origin/{branch}"], cwd=GIT_DIR)
-            after = run(["git", "rev-parse", "HEAD"], cwd=GIT_DIR, check=False).stdout.strip()
-            messages.append("git: downloaded latest" if before != after else "git: already up to date")
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return
+    index = TRASH_DIR / "index.json"
+    try:
+        entries = json.loads(index.read_text()) if index.exists() else []
+    except (OSError, json.JSONDecodeError):
+        entries = []
+    entries.append({
+        "at": time.strftime("%Y-%m-%d %H:%M"),
+        "app": app,
+        "side": side,
+        "rel": rel,
+        # The whole point of the trash is restoring the file where it was, and
+        # `rel` is relative to the synced pair, not to $HOME.
+        "path": str(path),
+        "trashed": str(target),
+    })
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_text(json.dumps(entries[-500:], indent=2) + "\n")
 
-    remote_raw = state["gdrive"].get("remote", "").strip()
-    if not remote_raw:
-        messages.append("drive: no folder set")
+
+def baseline_path(key: str) -> Path:
+    return BASELINE_DIR / f"{slug(key)}.json"
+
+
+def load_baseline(key: str) -> tuple[dict, dict]:
+    path = baseline_path(key)
+    if not path.exists():
+        return {}, {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}, {}
+    def to_fp(raw):
+        return {k: tuple(v) for k, v in raw.items()}
+    return to_fp(data.get("local", {})), to_fp(data.get("remote", {}))
+
+
+def save_baseline(key: str, local: dict, remote: dict) -> None:
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    path = baseline_path(key)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({
+        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "local": {k: list(v) for k, v in local.items()},
+        "remote": {k: list(v) for k, v in remote.items()},
+    }, indent=1) + "\n")
+    tmp.replace(path)
+
+
+class PairResult:
+    def __init__(self):
+        self.pushed = self.pulled = self.deleted = self.kept = 0
+        self.conflicts: list[str] = []
+        self.notes: list[str] = []
+        self.errors: list[str] = []
+
+
+def reconcile_pair(key: str, label: str, local: Path, remote: Path,
+                   patterns, delete: bool, dry: bool = False,
+                   prefer: str | None = None,
+                   allow_secrets: bool = False,
+                   single_name: str | None = None,
+                   remote_slack: int = DRIVE_TOLERANCE) -> PairResult:
+    """Bring one local path and its backend copy back into agreement."""
+    result = PairResult()
+    local = Path(local)
+    remote = Path(remote)
+    if not local.exists() and not remote.exists():
+        return result
+
+    lfp, rfp = fingerprint(local), fingerprint(remote)
+    if lfp is not None and rfp is not None and lfp[0] != rfp[0]:
+        kind = lambda fp: "directory" if fp[0] == "d" else "file"  # noqa: E731
+        result.errors.append(
+            f"{label}: {to_tilde(local)} is a {kind(lfp)} but the backend copy is a "
+            f"{kind(rfp)} — leaving both alone")
+        return result
+
+    base_local, base_remote = load_baseline(key)
+    first_sync = not base_local and not base_remote
+
+    local_base, remote_base, is_dir = pair_bases(local, remote)
+    name = single_name or local.name
+    if is_dir:
+        local_scan = scan_dir(local_base, patterns, allow_secrets)
+        remote_scan = scan_dir(remote_base, patterns, allow_secrets)
     else:
-        remote_root = expand(remote_raw)
-        if not remote_root.exists():
-            raise RuntimeError(f"Google Drive folder not found: {remote_root}")
-        count = 0
-        for app in state["apps"].values():
-            if not app["enabled"] or app["target"] != "gdrive":
-                continue
-            if selected and app["id"] not in selected:
-                continue
-            for p in app["paths"]:
-                rel = home_rel(expand(p))
-                src = remote_root / rel
-                if not src.exists():
-                    continue
-                if dry:
-                    print(f"  would download {to_tilde(src)}")
-                    continue
-                rsync(src, GDRIVE_STORE / rel, app.get("exclude", []), update=True)
-                count += 1
-        messages.append(f"drive: {count} path(s) downloaded")
-    return "; ".join(messages)
+        local_scan = {name: lfp} if lfp is not None else {}
+        remote_scan = {name: rfp} if rfp is not None else {}
+    plan = make_plan(local_scan, remote_scan, base_local, base_remote, delete, prefer,
+                     remote_slack=remote_slack,
+                     content_equal=lambda rel: (
+                         (left := digest(local_base / rel)) is not None
+                         and left == digest(remote_base / rel)))
 
+    if dry:
+        for rel in plan.push:
+            print(f"  would push {rel}")
+        for rel in plan.pull:
+            print(f"  would pull {rel}")
+        for rel in plan.delete_remote + plan.delete_local:
+            print(f"  would delete {rel}")
+        for rel in plan.conflicts:
+            print(f"  conflict {rel}")
+        result.pushed = len(plan.push)
+        result.pulled = len(plan.pull)
+        result.deleted = len(plan.delete_remote) + len(plan.delete_local)
+        result.conflicts = list(plan.conflicts)
+        result.kept = len(plan.kept)
+        return result
 
-def deploy(state, selected=None, dry=False):
-    count = 0
-    for app in state["apps"].values():
-        if not app["enabled"] or app["target"] not in ("git", "gdrive"):
+    # 1. Conflicts first, so both the winner and the loser are known before
+    #    anything is copied. The local copy wins in place; the backend's
+    #    version is kept beside it (or collected under the data directory on a
+    #    first sync, where dozens of default configs can disagree at once).
+    conflict_copies: list[str] = []
+    for rel in plan.conflicts:
+        if first_sync:
+            # The backend wins here (this machine is being restored), so the
+            # copy worth keeping is the one already on disk.
+            src = local_base / rel
+            dest = CONFLICTS_DIR / f"first-sync-{stamp()}" / rel
+        else:
+            # The local copy wins in place; keep the backend's version beside it
+            # so the other machine sees what it lost.
+            src = remote_base / rel
+            dest = local_base / Path(rel).parent / conflict_name(Path(rel).name)
+        if not src.exists():
             continue
-        if selected and app["id"] not in selected:
-            continue
-        root = store_root(app["target"])
-        for p in app["paths"]:
-            dest = expand(p)
-            src = root / home_rel(dest)
-            if not src.exists():
-                continue
-            if dry:
-                print(f"  would deploy {to_tilde(src)} -> {to_tilde(dest)}")
-                continue
-            rsync(src, dest, app.get("exclude", []))
-            count += 1
-    return f"deployed {count} path(s)"
+        try:
+            save_conflict_copy(src, dest)
+            if not first_sync:
+                conflict_copies.append(str(dest.relative_to(local_base)))
+        except OSError as exc:
+            result.errors.append(f"{label}: could not save {rel}: {exc}")
+
+    # 2. Copies. Directories travel as their own entries; rsync creates them.
+    push_rels = list(plan.push)
+    if not first_sync:
+        push_rels += [rel for rel in plan.conflicts if (local_base / rel).exists()]
+    rsync_copy(local_base, remote_base, push_rels + conflict_copies)
+    rsync_copy(remote_base, local_base, plan.pull)
+    result.pushed += len(push_rels) + len(conflict_copies)
+    result.pulled += len(plan.pull)
+    result.conflicts = list(plan.conflicts)
+
+    # 3. Deletions, to the trash, never unlinked.
+    for rel in plan.delete_remote:
+        target = remote_base / rel
+        if target.exists():
+            trash(target, rel, "remote", key)
+            result.deleted += 1
+    for rel in plan.delete_local:
+        target = local_base / rel
+        if target.exists():
+            trash(target, rel, "local", key)
+            result.deleted += 1
+    result.kept = len(plan.kept)
+
+    # 4. Baseline: what both sides hold now. rsync -a preserves mtimes, so the
+    #    copied fingerprint is the source one.
+    if not result.errors:
+        new_local = dict(base_local)
+        new_remote = dict(base_remote)
+        for rel in plan.same:
+            fp = local_scan.get(rel) or remote_scan.get(rel)
+            new_local[rel] = new_remote[rel] = fp
+        for rel in push_rels:
+            fp = local_scan.get(rel) or fingerprint(local_base / rel)
+            new_local[rel] = new_remote[rel] = fp
+        for rel in plan.pull:
+            fp = remote_scan.get(rel) or fingerprint(remote_base / rel)
+            new_local[rel] = new_remote[rel] = fp
+        for rel in conflict_copies:
+            fp = fingerprint(local_base / rel)
+            if fp is not None:
+                new_local[rel] = new_remote[rel] = fp
+        for rel in plan.delete_remote + plan.delete_local:
+            new_local.pop(rel, None)
+            new_remote.pop(rel, None)
+        for rel in plan.kept:
+            new_local[rel] = local_scan.get(rel) or base_local.get(rel)
+            new_remote[rel] = remote_scan.get(rel) or base_remote.get(rel)
+        # Directories implied by a copied file must exist on both sides too.
+        for rel in list(new_local):
+            parent = str(Path(rel).parent)
+            while parent not in (".", "", "/"):
+                if parent not in new_local:
+                    new_local[parent] = ("d",)
+                    new_remote[parent] = ("d",)
+                parent = str(Path(parent).parent)
+        save_baseline(key, new_local, new_remote)
+    return result
 
 
 # --- software --------------------------------------------------------------
@@ -485,6 +976,10 @@ def deploy(state, selected=None, dry=False):
 # travels with the rest of the config. `install-software` puts them back on a
 # fresh machine: plugins clone without privileges; packages are installed
 # through a terminal so pacman can ask for a password.
+#
+# The manifest is *synced data*: a compromised git remote or Drive folder can
+# rewrite it. Everything read from it is validated here, and nothing is
+# installed without the plan being shown first.
 
 def _omarchy_plugins():
     if not have("omarchy"):
@@ -508,10 +1003,22 @@ def _plugin_remote(pid: str) -> str:
 
 
 def _pacman(flag: str):
+    if not have("pacman"):
+        return []
     proc = run(["pacman", flag], check=False)
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def valid_package(name: str) -> bool:
+    """Package names go to pacman: reject anything that could be a flag."""
+    return bool(PKG_RE.match(name or ""))
+
+
+def valid_source(source: str) -> bool:
+    """Plugin sources go to git: only real remotes, never a leading dash."""
+    return bool(SOURCE_RE.match(source or ""))
 
 
 def capture_software() -> dict:
@@ -557,6 +1064,42 @@ def software_summary() -> dict:
     }
 
 
+def software_plan() -> dict:
+    """What `install-software` would do, with nothing executed."""
+    manifest = load_manifest()
+    if not manifest:
+        return {"ready": False, "reason": "no software manifest yet"}
+    installed = {p.get("id") for p in _omarchy_plugins()}
+    plugins, rejected_plugins = [], []
+    for pl in manifest.get("plugins", []):
+        if pl.get("id") in installed:
+            continue
+        source = pl.get("source", "")
+        if not valid_source(source):
+            rejected_plugins.append({"id": pl.get("id", ""), "source": source})
+            continue
+        plugins.append({"id": pl.get("id", ""), "source": source,
+                        "enabled": bool(pl.get("enabled"))})
+    have_pkgs = set(_pacman("-Qq"))
+    packages, rejected_packages = [], []
+    for kind in ("native", "aur"):
+        for name in manifest["packages"].get(kind, []):
+            if name in have_pkgs:
+                continue
+            if not valid_package(name):
+                rejected_packages.append(name)
+                continue
+            packages.append({"name": name, "kind": kind})
+    return {
+        "ready": True,
+        "capturedAt": manifest.get("capturedAt", ""),
+        "host": manifest.get("host", ""),
+        "plugins": plugins,
+        "packages": packages,
+        "rejected": {"plugins": rejected_plugins, "packages": rejected_packages},
+    }
+
+
 def _install_packages(native, aur) -> None:
     steps = []
     if native:
@@ -574,39 +1117,33 @@ def _install_packages(native, aur) -> None:
 
 
 def install_software(dry=False) -> str:
-    manifest = load_manifest()
-    if not manifest:
+    plan = software_plan()
+    if not plan.get("ready"):
         return "no software manifest yet — run Sync on a machine that already has your setup"
+    rejected = plan["rejected"]
+    if rejected["packages"] or rejected["plugins"]:
+        return (f"manifest has {len(rejected['packages'])} package name(s) and "
+                f"{len(rejected['plugins'])} plugin source(s) that are not valid — "
+                "refusing to install; re-capture on the source machine")
 
-    installed_plugins = {p.get("id") for p in _omarchy_plugins()}
     added = 0
-    skipped = 0
-    for pl in manifest.get("plugins", []):
-        if pl["id"] in installed_plugins:
-            continue
-        source = pl.get("source", "")
-        if not source:
-            skipped += 1
-            continue
+    for pl in plan["plugins"]:
         if dry:
-            print(f"  would add plugin {pl['id']} from {source}")
+            print(f"  would add plugin {pl['id']} from {pl['source']}")
             continue
-        args = ["omarchy", "plugin", "add", source, "--yes"]
-        if pl.get("enabled"):
+        args = ["omarchy", "plugin", "add", pl["source"], "--yes"]
+        if pl["enabled"]:
             args.append("--enable")
         run(args, check=False)
         added += 1
 
-    have_pkgs = set(_pacman("-Qq"))
-    native = [p for p in manifest["packages"]["native"] if p not in have_pkgs]
-    aur = [p for p in manifest["packages"]["aur"] if p not in have_pkgs]
+    native = [p["name"] for p in plan["packages"] if p["kind"] == "native"]
+    aur = [p["name"] for p in plan["packages"] if p["kind"] == "aur"]
     if not dry:
         _install_packages(native, aur)
 
-    parts = [f"{added} plugin(s) installed"]
-    if skipped:
-        parts.append(f"{skipped} with no git source skipped")
-    parts.append(f"{len(native)} native + {len(aur)} AUR package(s) missing")
+    parts = [f"{added} plugin(s) installed",
+             f"{len(native)} native + {len(aur)} AUR package(s)"]
     return "; ".join(parts)
 
 
@@ -699,112 +1236,711 @@ def find_repos():
 
 # --- backends --------------------------------------------------------------
 
-def git_sync(state, selected=None, dry=False):
+def git_identity(state) -> list[str]:
+    return ["-c", f"user.name={os.environ.get('USER', 'configsync')}",
+            "-c", "user.email=configsync@localhost"]
+
+
+def ensure_git_repo(state) -> str:
     if not have("git"):
         raise RuntimeError("git is not installed")
-    apps = state["apps"]
-    picked = [a for a in apps.values() if a["enabled"] and (not selected or a["id"] in selected)] \
-        if selected else [a for a in apps.values() if a["enabled"]]
-    git_apps = [a for a in picked if a["target"] == "git"]
-    if not git_apps:
-        return 0, "nothing to push to git"
-
-    ident = ["-c", f"user.name={os.environ.get('USER', 'configsync')}",
-             "-c", "user.email=configsync@localhost"]
-
-    if not dry:
-        (GIT_DIR).mkdir(parents=True, exist_ok=True)
-        if not (GIT_DIR / ".git").exists():
-            run(["git", "init", "-q", "-b", state["git"]["branch"]], cwd=GIT_DIR)
-        run(["git", "config", "user.name", os.environ.get("USER", "configsync")],
-            cwd=GIT_DIR, check=False)
-        run(["git", "config", "user.email", "configsync@localhost"], cwd=GIT_DIR, check=False)
-
-    # 1. capture local state into the store
-    for app, path in ((a, expand(p)) for a in git_apps for p in a["paths"]):
-        if not path.exists():
-            continue
-        rel = home_rel(path)
-        if dry:
-            print(f"  would stage {rel}")
-            continue
-        rsync(path, STORE / rel, app.get("exclude", []), delete=True)
-
-    if dry:
-        return 0, "dry run"
-
-    # 2. commit
-    run(["git", "add", "-A"], cwd=GIT_DIR)
-    status = run(["git", "status", "--porcelain"], cwd=GIT_DIR).stdout.strip()
-    if status:
-        host = socket.gethostname()
-        msg = f"configsync {host} {time.strftime('%Y-%m-%d %H:%M')}"
-        run(["git", *ident, "commit", "-q", "-m", msg], cwd=GIT_DIR)
-
-    # 3. integrate + push
+    GIT_DIR.mkdir(parents=True, exist_ok=True)
+    if not (GIT_DIR / ".git").exists():
+        run(["git", "init", "-q", "-b", state["git"]["branch"]], cwd=GIT_DIR)
+    run(["git", "config", "user.name", os.environ.get("USER", "configsync")],
+        cwd=GIT_DIR, check=False)
+    run(["git", "config", "user.email", "configsync@localhost"], cwd=GIT_DIR, check=False)
     remote = state["git"].get("remote", "").strip()
-    branch = state["git"]["branch"]
     if remote:
         run(["git", "remote", "remove", "origin"], cwd=GIT_DIR, check=False)
         run(["git", "remote", "add", "origin", remote], cwd=GIT_DIR)
-        run(["git", "fetch", "-q", "origin"], cwd=GIT_DIR, check=False)
-        has_remote = run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"],
-                         cwd=GIT_DIR, check=False).returncode == 0
-        if has_remote:
-            rebase = run(["git", *ident, "rebase", f"origin/{branch}"],
-                         cwd=GIT_DIR, check=False)
-            if rebase.returncode != 0:
-                run(["git", "rebase", "--abort"], cwd=GIT_DIR, check=False)
+    return remote
+
+
+def git_prepare(state) -> None:
+    """Get the store to the remote's latest before comparing.
+
+    Doing this first is what stops a fresh machine from pushing its own default
+    configs over the real ones: the store already holds the setup being
+    restored, so the reconciler sees those files as already correct.
+    """
+    remote = state["git"].get("remote", "").strip()
+    if not remote:
+        return
+    branch = state["git"]["branch"]
+    run(["git", "fetch", "-q", "origin"], cwd=GIT_DIR, check=False)
+    has_remote = run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"],
+                     cwd=GIT_DIR, check=False).returncode == 0
+    if not has_remote:
+        return
+    if not _git(GIT_DIR, "rev-parse", "HEAD"):
+        run(["git", "checkout", "-q", "-B", branch, f"origin/{branch}"], cwd=GIT_DIR)
+        return
+    # Uncommitted leftovers from an interrupted pass would be thrown away by a
+    # checkout; commit them first so nothing is lost.
+    if _git(GIT_DIR, "status", "--porcelain"):
+        run(["git", *git_identity(state), "commit", "-q", "-am",
+             "configsync: recovered uncommitted store changes"], cwd=GIT_DIR)
+    rebase = run(["git", *git_identity(state), "rebase", "-q", f"origin/{branch}"],
+                 cwd=GIT_DIR, check=False)
+    if rebase.returncode != 0:
+        run(["git", "rebase", "--abort"], cwd=GIT_DIR, check=False)
+        raise RuntimeError(
+            "conflict with the remote — the same file changed on both sides. "
+            "Resolve it in the git backend repo and sync again.")
+
+
+def git_commit_push(state) -> str:
+    if not (GIT_DIR / ".git").exists():
+        return ""
+    run(["git", "add", "-A"], cwd=GIT_DIR)
+    if _git(GIT_DIR, "status", "--porcelain"):
+        msg = f"configsync {socket.gethostname()} {time.strftime('%Y-%m-%d %H:%M')}"
+        run(["git", *git_identity(state), "commit", "-q", "-m", msg], cwd=GIT_DIR)
+    remote = state["git"].get("remote", "").strip()
+    if not remote:
+        return "git: no remote set"
+    branch = state["git"]["branch"]
+    push = run(["git", "push", "-q", "-u", "origin", branch], cwd=GIT_DIR, check=False)
+    if push.returncode != 0:
+        return "git: push failed (the next pass retries)"
+    return "git: pushed"
+
+
+def app_patterns(app) -> list[str]:
+    return list(EXCLUDES) + list(app.get("exclude", []) or [])
+
+
+def app_pairs(state, selected=None) -> list[dict]:
+    """One entry per enabled path: where it lives locally and in the backend."""
+    pairs: list[dict] = []
+    drive_raw = state["gdrive"].get("remote", "").strip()
+    for cid, app in state["apps"].items():
+        if not app.get("enabled") or app["target"] not in ("git", "gdrive"):
+            continue
+        if selected and cid not in selected:
+            continue
+        for raw in app["paths"]:
+            original = expand(raw)
+            try:
+                rel = home_rel(original)
+            except ValueError:
+                continue  # a hand-edited state path outside $HOME
+            if app["target"] == "gdrive":
+                if not drive_raw:
+                    continue
+                backend = expand(drive_raw) / rel
+            else:
+                backend = STORE / rel
+            pairs.append({
+                "key": f"{app['target']}:{cid}:{rel}",
+                "cid": cid,
+                "app": app,
+                "local": local_root(original),
+                "backend": backend,
+                # The name a single-file pair travels under (a resolved
+                # symlink can change the name on disk).
+                "name": Path(rel).name,
+            })
+    return pairs
+
+
+class Report:
+    """The result of one pass, in the shape the panel and lastSync use."""
+
+    def __init__(self):
+        self.pushed = self.pulled = self.deleted = self.kept = 0
+        self.conflicts: list[str] = []
+        self.notes: list[str] = []
+        self.errors: list[str] = []
+
+    def absorb(self, label: str, res: PairResult) -> None:
+        self.pushed += res.pushed
+        self.pulled += res.pulled
+        self.deleted += res.deleted
+        self.kept += res.kept
+        self.conflicts += [f"{label}: {rel}" for rel in res.conflicts]
+        self.notes += res.notes
+        self.errors += res.errors
+
+    def ok(self) -> bool:
+        return not self.errors
+
+    def message(self) -> str:
+        if self.errors:
+            return "⚠ " + self.errors[0]
+        if not self.pushed and not self.pulled and not self.deleted:
+            base = "up to date"
+        else:
+            parts = []
+            if self.pushed:
+                parts.append(f"{self.pushed} sent")
+            if self.pulled:
+                parts.append(f"{self.pulled} received")
+            if self.deleted:
+                parts.append(f"{self.deleted} removed")
+            base = ", ".join(parts)
+        if self.conflicts:
+            base += f" · {len(self.conflicts)} conflict copy(ies)"
+        if self.kept:
+            base += f" · {self.kept} deletion(s) not propagated"
+        return base
+
+
+def sync_all(state, selected=None, dry=False, prefer=None, only=None) -> Report:
+    report = Report()
+    pairs = app_pairs(state, selected)
+    if not dry:
+        try:
+            capture_software()
+        except Exception as exc:  # noqa: BLE001
+            report.notes.append(f"software capture skipped: {exc}")
+    has_git = any(p["app"]["target"] == "git" for p in pairs)
+    if has_git and (not only or only == "git"):
+        try:
+            ensure_git_repo(state)
+            if not dry:
+                git_prepare(state)
+        except Exception as exc:  # noqa: BLE001
+            report.errors.append(str(exc).splitlines()[0])
+
+    for pair in pairs:
+        app = pair["app"]
+        if only and app["target"] != only:
+            continue
+        if app["target"] == "gdrive" and not state["gdrive"].get("remote", "").strip():
+            continue
+        delete = True if app["target"] == "git" else bool(state["gdrive"].get("delete", False))
+        try:
+            res = reconcile_pair(pair["key"], app["name"], pair["local"],
+                                 pair["backend"],
+                                 app_patterns(app), delete=delete, dry=dry,
+                                 prefer=prefer,
+                                 allow_secrets=bool(app.get("allowSecrets")),
+                                 remote_slack=backend_tolerance(app),
+                                 single_name=pair["name"])
+            report.absorb(app["name"], res)
+        except Exception as exc:  # noqa: BLE001 — report, never crash the shell
+            report.errors.append(f"{app['name']}: {str(exc).splitlines()[0]}")
+
+    if not dry and report.ok() and has_git and (not only or only == "git"):
+        try:
+            note = git_commit_push(state)
+            if note:
+                report.notes.append(note)
+        except Exception as exc:  # noqa: BLE001
+            report.errors.append(str(exc).splitlines()[0])
+    return report
+
+
+# --- inotify ---------------------------------------------------------------
+#
+# A thin ctypes wrapper instead of a dependency on inotify-tools: the watcher
+# then needs nothing beyond python3 and rsync, and it can prune excluded
+# directories while it walks the tree.
+
+IN_MODIFY = 0x00000002
+IN_ATTRIB = 0x00000004
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+IN_Q_OVERFLOW = 0x00004000
+IN_IGNORED = 0x00008000
+IN_ISDIR = 0x40000000
+
+WATCH_MASK = (IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM
+              | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_DELETE_SELF
+              | IN_MOVE_SELF)
+
+
+class Inotify:
+    """Recursive watches for a set of trees, pruned by the exclude patterns."""
+
+    def __init__(self, max_watches=200000):
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6",
+                           use_errno=True)
+        self._add = libc.inotify_add_watch
+        self._add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        self._add.restype = ctypes.c_int
+        fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+        self.fd = fd
+        self.max_watches = max_watches
+        # wd -> (tree key, directory relative to the tree, the watched path's
+        # own relative name; empty for directories, the file name for a file)
+        self.watches: dict[int, tuple[str, str, str]] = {}
+        self.overflow = False
+        self.failed: list[str] = []
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def add_tree(self, key: str, root: Path, patterns, allow_secrets=False,
+                 self_name: str | None = None) -> int:
+        if not root.exists():
+            return 0
+        if not root.is_dir():
+            return self._watch(key, "", self_name or root.name, root)
+        added = 0
+        for dirpath, dirnames, _files in os.walk(root, followlinks=False):
+            here = Path(dirpath)
+            rel = "" if here == root else str(here.relative_to(root))
+            added += self._watch(key, rel, "", here)
+            keep = []
+            for d in dirnames:
+                child_rel = f"{rel}/{d}".lstrip("/")
+                if is_excluded_path(child_rel, patterns, allow_secrets):
+                    continue
+                if (here / d).is_symlink():
+                    continue
+                keep.append(d)
+            dirnames[:] = keep
+            if len(self.watches) > self.max_watches:
                 raise RuntimeError(
-                    "conflict with the remote — the same file changed on both sides. "
-                    "Resolve it in the git backend repo and sync again.")
-        run(["git", "push", "-q", "-u", "origin", branch], cwd=GIT_DIR)
+                    "too many directories to watch — narrow the synced folders "
+                    "or raise fs.inotify.max_user_watches")
+        return added
 
-    # 4. apply whatever the merge brought back
-    for app, path in ((a, expand(p)) for a in git_apps for p in a["paths"]):
-        rel = home_rel(path)
-        if (STORE / rel).exists():
-            rsync(STORE / rel, path, app.get("exclude", []))
+    def _watch(self, key: str, rel_dir: str, self_rel: str, path: Path) -> int:
+        wd = self._add(self.fd, str(path).encode("utf-8", "surrogateescape"),
+                       WATCH_MASK)
+        if wd < 0:
+            if len(self.failed) < 5:
+                self.failed.append(str(path))
+            return 0
+        self.watches[wd] = (key, rel_dir, self_rel)
+        return 1
 
-    return 0, f"git: {len(git_apps)} app(s) up to date"
+    def read(self):
+        """[(key, rel path, mask)] for everything that happened since last read."""
+        events = []
+        while True:
+            try:
+                data = os.read(self.fd, 1 << 20)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            if not data:
+                break
+            offset = 0
+            while offset + 16 <= len(data):
+                wd, mask, _cookie, length = struct.unpack_from("iIII", data, offset)
+                offset += 16
+                name = data[offset:offset + length].split(b"\0", 1)[0].decode(
+                    "utf-8", "surrogateescape")
+                offset += length
+                if mask & IN_Q_OVERFLOW:
+                    self.overflow = True
+                    continue
+                if mask & IN_IGNORED:
+                    self.watches.pop(wd, None)
+                    continue
+                watch = self.watches.get(wd)
+                if watch is None:
+                    continue
+                key, rel_dir, self_rel = watch
+                if name:
+                    rel = f"{rel_dir}/{name}" if rel_dir else name
+                else:
+                    rel = self_rel or rel_dir
+                events.append((key, rel, mask))
+        return events
 
 
-def gdrive_sync(state, selected=None, dry=False):
-    remote_root_raw = state["gdrive"].get("remote", "").strip()
-    if not remote_root_raw:
-        return 0, "skipped: no Google Drive folder set"
-    if not have("rsync"):
-        raise RuntimeError("rsync is not installed")
-    remote_root = expand(remote_root_raw)
-    if not dry and not remote_root.exists():
-        raise RuntimeError(f"Google Drive folder not found: {remote_root}")
+def watch_entries(state):
+    """Everything the watcher needs for one enabled path."""
+    entries = []
+    for pair in app_pairs(state):
+        if not pair["local"].exists():
+            continue
+        local_base, backend_base, _is_dir = pair_bases(pair["local"], pair["backend"])
+        entries.append(dict(pair,
+                            patterns=app_patterns(pair["app"]),
+                            local_base=local_base,
+                            backend_base=backend_base))
+    return entries
 
-    apps = [a for a in state["apps"].values()
-            if a["enabled"] and a["target"] == "gdrive" and (not selected or a["id"] in selected)]
-    if not apps:
-        return 0, "nothing to push to Google Drive"
 
-    delete = bool(state["gdrive"].get("delete", False))
-    count = 0
-    for app in apps:
-        for p in app["paths"]:
-            src = expand(p)
-            if not src.exists():
+# --- systemd user service --------------------------------------------------
+
+_systemd_cache: bool | None = None
+
+
+def systemd_available() -> bool:
+    global _systemd_cache
+    if _systemd_cache is not None:
+        return _systemd_cache
+    ok = False
+    if have("systemctl") and os.environ.get("XDG_RUNTIME_DIR"):
+        proc = run(["systemctl", "--user", "show", "--property=Version"],
+                   check=False, timeout=5)
+        ok = proc.returncode == 0
+    _systemd_cache = ok
+    return ok
+
+
+def unit_text(script: Path) -> str:
+    quoted = str(script).replace("\\", "\\\\").replace('"', '\\"')
+    return f"""[Unit]
+Description=Config Sync watcher (configs to git, folders to Drive)
+Documentation=https://github.com/iamkuo/omarchy-configsync-plugin
+After=default.target
+
+[Service]
+Type=simple
+ExecStart="{sys.executable}" "{quoted}" watch
+Restart=on-failure
+RestartSec=15
+Nice=10
+IOSchedulingClass=idle
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def service_status() -> dict:
+    path = UNIT_DIR / UNIT_NAME
+    installed = path.exists()
+    active = enabled = False
+    if installed and have("systemctl") and systemd_available():
+        active = run(["systemctl", "--user", "is-active", UNIT_NAME],
+                     check=False, timeout=5).stdout.strip() == "active"
+        enabled = run(["systemctl", "--user", "is-enabled", UNIT_NAME],
+                      check=False, timeout=5).stdout.strip() == "enabled"
+    return {"installed": installed, "active": active, "enabled": enabled,
+            "path": to_tilde(path)}
+
+
+def service_install(verbose=True) -> tuple[bool, str]:
+    """Write and start the user unit. Returns (ok, message)."""
+    script = Path(__file__).resolve()
+    if not systemd_available():
+        return False, "no systemd user session — the watcher runs inside the shell"
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    path = UNIT_DIR / UNIT_NAME
+    text = unit_text(script)
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+    for args in (["daemon-reload"], ["enable", "--now", UNIT_NAME]):
+        proc = run(["systemctl", "--user", *args], check=False, timeout=30)
+        if proc.returncode != 0:
+            return False, f"systemctl --user {' '.join(args)}: {proc.stdout.strip()}"
+    if verbose:
+        print(f"watch: systemd unit {to_tilde(path)} installed and started")
+    return True, "systemd"
+
+
+def service_uninstall(verbose=True) -> None:
+    path = UNIT_DIR / UNIT_NAME
+    if have("systemctl") and systemd_available():
+        run(["systemctl", "--user", "disable", "--now", UNIT_NAME], check=False, timeout=30)
+    if path.exists():
+        path.unlink()
+        if have("systemctl") and systemd_available():
+            run(["systemctl", "--user", "daemon-reload"], check=False, timeout=30)
+    if verbose:
+        print("watch: systemd unit removed")
+
+
+# --- the watcher -----------------------------------------------------------
+
+def write_watch_status(**fields) -> None:
+    payload = {"pid": os.getpid(), "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if WATCH_STATUS.exists():
+        try:
+            payload.update(json.loads(WATCH_STATUS.read_text()))
+        except (OSError, json.JSONDecodeError):
+            pass
+    payload.update(fields)
+    tmp = WATCH_STATUS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp.replace(WATCH_STATUS)
+
+
+def watch_status() -> dict:
+    """Live status for the panel: what the watcher is doing right now."""
+    info = {"running": False, "mode": "", "trees": 0, "lastEvent": "",
+            "lastPass": "", "startedAt": "", "lastResult": ""}
+    if WATCH_STATUS.exists():
+        try:
+            info.update(json.loads(WATCH_STATUS.read_text()))
+        except (OSError, json.JSONDecodeError):
+            pass
+    info["running"] = lock_held(WATCH_LOCK)
+    if not info["running"]:
+        info["mode"] = ""
+    return info
+
+
+def quick_push(state, report: Report, pending: dict[str, set[str]],
+               entries: dict[str, dict]) -> bool:
+    """Copy just the files that changed locally, and commit git apps.
+
+    Anything that is not a simple local edit — a deletion, or a backend copy
+    that moved since the baseline — is left to the full pass, which knows how
+    to resolve it.
+    """
+    deferred = False
+    for key, rels in pending.items():
+        entry = entries.get(key)
+        if entry is None:
+            continue
+        app = entry["app"]
+        local, backend = entry["local_base"], entry["backend_base"]
+        base_local, base_remote = load_baseline(key)
+        todo = []
+        for rel in sorted(rels):
+            if is_excluded_path(rel, entry["patterns"], bool(app.get("allowSecrets"))):
                 continue
-            dst = remote_root / home_rel(src)
-            if dry:
-                print(f"  would rsync {to_tilde(src)} <-> {to_tilde(dst)}")
+            fp = fingerprint(local / rel)
+            if fp is None:
+                deferred = True          # a deletion: needs the three-way call
                 continue
-            rsync(src, dst, app.get("exclude", []), delete=delete, update=True)  # push newer
-            rsync(dst, src, app.get("exclude", []), update=True)                 # pull newer
-            count += 1
-    return 0, f"Google Drive: {count} path(s) reconciled"
+            if same(fp, base_local.get(rel), LOCAL_TOLERANCE):
+                continue                 # already in sync (often our own pull)
+            base = base_remote.get(rel)
+            remote_fp = fingerprint(backend / rel)
+            if (base is not None and remote_fp is not None
+                    and not same(remote_fp, base, backend_tolerance(app))):
+                deferred = True          # the other side moved too: reconcile
+                continue
+            if base is not None and remote_fp is None:
+                deferred = True          # removed on the other side
+                continue
+            todo.append((rel, fp))
+        if not todo:
+            continue
+        try:
+            rsync_copy(local, backend, [rel for rel, _fp in todo])
+        except RuntimeError as exc:
+            report.errors.append(str(exc).splitlines()[0])
+            continue
+        report.pushed += len(todo)
+        for rel, fp in todo:
+            base_local[rel] = base_remote[rel] = fp
+        save_baseline(key, base_local, base_remote)
+        if app["target"] == "git":
+            note = git_commit_push(state)
+            if note:
+                report.notes.append(note)
+    return deferred
+
+
+def run_watch(args) -> int:
+    state = load_state()
+    if not state["watch"].get("enabled") and not args.force:
+        print("watch: off (turn it on with `configsync set-backend watch enabled true`)")
+        return 0
+    if lock_held(WATCH_LOCK):
+        print("watch: another watcher is already running")
+        return 0
+
+    WATCH_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(WATCH_LOCK), os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        print("watch: another watcher is already running")
+        return 0
+
+    stopping = {"now": False}
+
+    def stop(_signum, _frame):
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    debounce = max(1, int(state["watch"].get("debounceSeconds", 4)))
+    pull_seconds = max(60, int(state["watch"].get("pullMinutes", 10)) * 60)
+
+    watcher = None
+    mode = "poll"
+    try:
+        watcher = Inotify()
+        mode = "inotify"
+    except OSError as exc:
+        print(f"watch: inotify unavailable ({exc}); falling back to polling")
+
+    entries: dict[str, dict] = {}
+
+    def rebuild() -> None:
+        """(Re)build the watch set from the current state."""
+        nonlocal watcher, mode
+        if watcher is not None:
+            watcher.close()
+            try:
+                watcher = Inotify()
+            except OSError as exc:
+                print(f"watch: inotify unavailable ({exc}); falling back to polling")
+                watcher = None
+                mode = "poll"
+        entries.clear()
+        for entry in watch_entries(state):
+            entries[entry["key"]] = entry
+            if watcher is not None:
+                try:
+                    watcher.add_tree(entry["key"], entry["local"], entry["patterns"],
+                                     bool(entry["app"].get("allowSecrets")),
+                                     entry["name"])
+                except (OSError, RuntimeError) as exc:
+                    print(f"watch: cannot watch {to_tilde(entry['local'])}: {exc}")
+        write_watch_status(mode=mode, trees=len(entries))
+
+    rebuild()
+    write_watch_status(mode=mode, trees=len(entries),
+                       startedAt=time.strftime("%Y-%m-%d %H:%M:%S"),
+                       lastEvent="", lastPass="")
+    print(f"watch: {len(entries)} path(s), mode {mode}, debounce {debounce}s, "
+          f"pull every {pull_seconds // 60} min")
+
+    pending: dict[str, set[str]] = {}
+    first_event = last_event = 0.0
+    next_pull = time.time()          # one catch-up pass at startup
+    forced = False
+    state_mtime = 0.0
+
+    try:
+        while not stopping["now"]:
+            now = time.time()
+            timeout = 1.0
+            if pending:
+                timeout = min(timeout, max(0.2, debounce - (now - last_event)))
+            timeout = min(timeout, max(0.2, next_pull - now))
+
+            events = []
+            if watcher is not None:
+                try:
+                    ready, _w, _x = select.select([watcher.fd], [], [], timeout)
+                except (InterruptedError, OSError):
+                    ready = []
+                if ready:
+                    events = watcher.read()
+            else:
+                time.sleep(min(timeout, 2.0))
+
+            # Reload when the panel changed something.
+            try:
+                mtime = STATE_FILE.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            if mtime != state_mtime:
+                state_mtime = mtime
+                state = load_state()
+                if not state["watch"].get("enabled") and not args.force:
+                    print("watch: turned off in the panel; stopping")
+                    break
+                debounce = max(1, int(state["watch"].get("debounceSeconds", 4)))
+                pull_seconds = max(60, int(state["watch"].get("pullMinutes", 10)) * 60)
+                pending.clear()
+                next_pull = time.time()
+                rebuild()
+
+            if watcher is not None and watcher.overflow:
+                watcher.overflow = False
+                forced = True
+
+            now = time.time()
+            for key, rel, mask in events:
+                if not rel:
+                    continue
+                pending.setdefault(key, set()).add(rel)
+                if mask & IN_CREATE and mask & IN_ISDIR and watcher is not None:
+                    entry = entries.get(key)
+                    if entry is not None:
+                        try:
+                            watcher.add_tree(key, entry["local_base"] / rel,
+                                             entry["patterns"],
+                                             bool(entry["app"].get("allowSecrets")))
+                        except (OSError, RuntimeError):
+                            pass
+            if events:
+                if not first_event:
+                    first_event = now
+                last_event = now
+                write_watch_status(lastEvent=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                   pending=sum(len(v) for v in pending.values()))
+
+            if pending and ((now - last_event >= debounce)
+                            or (now - first_event >= debounce * 5)):
+                report = Report()
+                try:
+                    with OperationLock():
+                        if quick_push(state, report, pending, entries):
+                            next_pull = 0.0   # needs the full three-way pass
+                except RuntimeError:
+                    next_pull = time.time() + 30  # a manual sync holds the lock
+                pending.clear()
+                first_event = 0.0
+                if report.pushed or report.errors:
+                    write_watch_status(
+                        lastPass=time.strftime("%Y-%m-%d %H:%M:%S"),
+                        lastResult=report.message(), lastOk=report.ok())
+
+            if forced or time.time() >= next_pull:
+                forced = False
+                next_pull = time.time() + pull_seconds
+                report = Report()
+                try:
+                    with OperationLock():
+                        report = sync_all(state)
+                        record_result(state, report.ok(), report.message(), report)
+                except RuntimeError:
+                    next_pull = time.time() + 60
+                except Exception as exc:  # noqa: BLE001
+                    report.errors.append(str(exc).splitlines()[0])
+                write_watch_status(lastPass=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                   lastResult=report.message(), lastOk=report.ok())
+    finally:
+        if watcher is not None:
+            watcher.close()
+        try:
+            WATCH_STATUS.unlink()
+        except OSError:
+            pass
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    return 0
 
 
 # --- commands --------------------------------------------------------------
 
+def record_result(state, ok, message, report: Report | None = None) -> None:
+    # Re-read the file before writing: a long pass must not clobber a toggle
+    # the user flipped in the panel meanwhile. Only the last-sync result is
+    # ours to write.
+    fresh = load_state()
+    fresh["lastSync"] = {
+        "at": time.strftime("%Y-%m-%d %H:%M"),
+        "ok": ok,
+        "message": message,
+    }
+    if report is not None:
+        fresh["lastSync"].update({
+            "pushed": report.pushed,
+            "pulled": report.pulled,
+            "deleted": report.deleted,
+            "conflicts": len(report.conflicts),
+            "conflictPaths": report.conflicts[:5],
+            "notes": report.notes[-5:],
+        })
+    save_state(fresh)
+
+
 def cmd_scan(args):
-    with OperationLock() as lock:
+    with OperationLock():
         state = load_state()
         added = merge_detected(state)
         save_state(state)
@@ -816,8 +1952,16 @@ def cmd_state(args):
     apps = [dict(id=cid, **app) for cid, app in state["apps"].items()]
     apps.sort(key=lambda a: a["name"].lower())
     gdrive_remote = state["gdrive"].get("remote", "").strip()
+    trash_count = 0
+    if (TRASH_DIR / "index.json").exists():
+        try:
+            trash_count = len(json.loads((TRASH_DIR / "index.json").read_text()))
+        except (OSError, json.JSONDecodeError):
+            trash_count = 0
     out = {
         "version": state["version"],
+        # For the panel: it shortens paths against this instead of guessing.
+        "home": str(HOME),
         "git": {
             "remote": state["git"].get("remote", ""),
             "branch": state["git"].get("branch", "main"),
@@ -827,9 +1971,13 @@ def cmd_state(args):
             "remote": state["gdrive"].get("remote", ""),
             "configured": bool(gdrive_remote),
             "available": bool(gdrive_remote) and expand(gdrive_remote).exists(),
+            "delete": bool(state["gdrive"].get("delete", False)),
         },
-        "auto": state["auto"],
+        "watch": dict(state["watch"], **watch_status(),
+                      systemd=systemd_available(),
+                      service=service_status()),
         "lastSync": state["lastSync"],
+        "trash": trash_count,
         "software": software_summary(),
         "apps": apps,
     }
@@ -858,6 +2006,14 @@ def cmd_set_target(args):
     print("ok")
 
 
+def cmd_set_secrets(args):
+    state = load_state()
+    _app(state, args.id)["allowSecrets"] = args.value == "true"
+    save_state(state)
+    print("ok — key and token files in this item are copied as-is"
+          if args.value == "true" else "ok — key and token files are skipped again")
+
+
 def cmd_set_backend(args):
     state = load_state()
     if args.backend == "git":
@@ -874,16 +2030,34 @@ def cmd_set_backend(args):
             state["gdrive"]["delete"] = args.value == "true"
         else:
             sys.exit("gdrive accepts remote or delete")
-    elif args.backend == "auto":
+    elif args.backend == "watch":
         if args.key == "enabled":
-            state["auto"]["enabled"] = args.value == "true"
+            state["watch"]["enabled"] = args.value == "true"
+        elif args.key == "debounce":
+            state["watch"]["debounceSeconds"] = max(1, int(args.value))
+        elif args.key == "pull":
+            state["watch"]["pullMinutes"] = max(1, int(args.value))
+        else:
+            sys.exit("watch accepts enabled, debounce or pull")
+    elif args.backend == "auto":
+        # Kept so an older panel or script does not break; maps onto the watcher.
+        if args.key == "enabled":
+            state["watch"]["enabled"] = args.value == "true"
         elif args.key == "interval":
-            state["auto"]["intervalMinutes"] = max(5, int(args.value))
+            state["watch"]["pullMinutes"] = max(1, int(args.value))
         else:
             sys.exit("auto accepts enabled or interval")
     else:
         sys.exit("unknown backend")
     save_state(state)
+    if args.backend in ("watch", "auto") and args.key == "enabled":
+        if args.value == "true":
+            ok, message = service_install(verbose=False)
+            print(f"watch: on ({'systemd user service' if ok else message})")
+        else:
+            service_uninstall(verbose=False)
+            print("watch: off")
+        return
     print("ok")
 
 
@@ -896,91 +2070,169 @@ def cmd_set_all(args):
 
 
 def cmd_sync(args):
-    with OperationLock() as lock:
+    with OperationLock():
         state = load_state()
         selected = set(args.ids) if args.ids else None
-        messages = []
-        ok = True
+        report = sync_all(state, selected, dry=args.dry_run, prefer=args.prefer,
+                          only=args.only)
+        if args.dry_run:
+            print(report.message())
+            return
+        record_result(state, report.ok(), report.message(), report)
+        print(report.message())
+        sys.exit(0 if report.ok() else 1)
+
+
+def cmd_watch(args):
+    if args.once:
+        with OperationLock():
+            state = load_state()
+            report = sync_all(state)
+            record_result(state, report.ok(), report.message(), report)
+            print(report.message())
+            return 0 if report.ok() else 1
+    return run_watch(args)
+
+
+def cmd_service(args):
+    if args.action == "install":
+        ok, message = service_install()
+        print(f"service: {'installed' if ok else message}")
+        return 0 if ok else 1
+    if args.action == "uninstall":
+        service_uninstall()
+        return 0
+    print(json.dumps(service_status(), indent=2))
+    return 0
+
+
+def cmd_trash(args):
+    index = TRASH_DIR / "index.json"
+    entries = []
+    if index.exists():
         try:
-            # Refresh the software manifest first so this same sync carries it.
-            if not args.dry_run:
-                capture_software()
-            if not args.only or args.only == "git":
-                _, msg = git_sync(state, selected, dry=args.dry_run)
-                messages.append(msg)
-            if not args.only or args.only == "gdrive":
-                _, msg = gdrive_sync(state, selected, dry=args.dry_run)
-                messages.append(msg)
-        except Exception as exc:  # noqa: BLE001 — report, never crash the shell
-            ok = False
-            messages.append(str(exc).splitlines()[0])
-        _record(state, ok, "; ".join(messages))
-
-
-def _record(state, ok, message):
-    # Re-read the file before writing: a long sync (or a background auto-sync)
-    # must not clobber a toggle the user flipped in the panel meanwhile. Only
-    # the last-sync result is ours to write.
-    fresh = load_state()
-    fresh["lastSync"] = {
-        "at": time.strftime("%Y-%m-%d %H:%M"),
-        "ok": ok,
-        "message": message,
-    }
-    save_state(fresh)
-    print(message)
-    sys.exit(0 if ok else 1)
+            entries = json.loads(index.read_text())
+        except (OSError, json.JSONDecodeError):
+            entries = []
+    if args.action == "list":
+        print(json.dumps(entries[-args.limit:], indent=2))
+        return 0
+    if args.action == "empty":
+        shutil.rmtree(TRASH_DIR, ignore_errors=True)
+        print(f"trash: emptied ({len(entries)} entr(ies) removed)")
+        return 0
+    wanted = entries if args.action == "restore-all" else entries[-1:]
+    remaining = [] if args.action == "restore-all" else entries[:-1]
+    restored = 0
+    for entry in wanted:
+        source = Path(entry.get("trashed", ""))
+        if not source.exists():
+            continue
+        # Older entries only know the pair-relative path; fall back to it.
+        target = Path(entry.get("path") or (HOME / entry.get("rel", "")))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if target.exists():
+                # Never overwrite what is there now — keep both.
+                target = target.with_name(conflict_name(target.name))
+            shutil.move(str(source), str(target))
+            restored += 1
+        except (OSError, shutil.Error) as exc:
+            print(f"trash: cannot restore {to_tilde(target)}: {exc}")
+            remaining.append(entry)
+    # Drop only the directories this call emptied; anything still trashed stays.
+    for stamp_dir in sorted(TRASH_DIR.glob("*")):
+        if stamp_dir.is_dir() and not any(stamp_dir.rglob("*")):
+            shutil.rmtree(stamp_dir, ignore_errors=True)
+    if remaining:
+        index.write_text(json.dumps(remaining[-500:], indent=2) + "\n")
+    elif index.exists():
+        index.write_text("[]\n")
+    print(f"trash: restored {restored} item(s) into {to_tilde(HOME)}")
+    return 0
 
 
 def cmd_download(args):
-    with OperationLock() as lock:
+    """Fetch the git backend into the store without touching $HOME."""
+    with OperationLock():
         state = load_state()
-        selected = set(args.ids) if args.ids else None
         try:
-            _record(state, True, download(state, selected, dry=args.dry_run))
+            ensure_git_repo(state)
+            git_prepare(state)
+            record_result(state, True, "downloaded the git backend into the local store")
+            print("downloaded the git backend into the local store")
         except Exception as exc:  # noqa: BLE001
-            _record(state, False, str(exc).splitlines()[0])
+            record_result(state, False, str(exc).splitlines()[0])
+            print(f"error: {str(exc).splitlines()[0]}", file=sys.stderr)
+            return 1
+    return 0
 
 
 def cmd_deploy(args):
-    with OperationLock() as lock:
+    """Write the backend's copy into $HOME, backend wins (recovery tool)."""
+    with OperationLock():
         state = load_state()
-        selected = set(args.ids) if args.ids else None
-        try:
-            _record(state, True, deploy(state, selected, dry=args.dry_run))
-        except Exception as exc:  # noqa: BLE001
-            _record(state, False, str(exc).splitlines()[0])
+        report = sync_all(state, None, dry=args.dry_run, prefer="remote")
+        if args.dry_run:
+            print(report.message())
+            return 0
+        record_result(state, report.ok(), report.message(), report)
+        print(report.message())
+        return 0 if report.ok() else 1
 
 
 def cmd_capture_software(args):
-    with OperationLock() as lock:
+    with OperationLock():
         manifest = capture_software()
         print(f"captured {len(manifest['plugins'])} plugin(s) and "
-              f"{len(manifest['packages']['native'])} + {len(manifest['packages']['aur'])} package(s)")
+              f"{len(manifest['packages']['native'])} + "
+              f"{len(manifest['packages']['aur'])} package(s)")
 
 
 def cmd_install_software(args):
-    with OperationLock() as lock:
+    with OperationLock():
         state = load_state()
         try:
-            _record(state, True, install_software(dry=args.dry_run))
+            if args.plan:
+                print(json.dumps(software_plan(), indent=2))
+                return 0
+            if not args.yes and not sys.stdin.isatty():
+                # Called from the shell without confirmation: show the plan.
+                print(json.dumps(software_plan(), indent=2))
+                return 0
+            message = install_software(dry=args.dry_run)
+            record_result(state, True, message)
+            print(message)
         except Exception as exc:  # noqa: BLE001
-            _record(state, False, str(exc).splitlines()[0])
+            record_result(state, False, str(exc).splitlines()[0])
+            print(f"error: {str(exc).splitlines()[0]}", file=sys.stderr)
+            return 1
+    return 0
 
 
 def cmd_reset(args):
-    with OperationLock() as lock:
+    with OperationLock():
         state = default_state()
         merge_detected(state)
         save_state(state)
         if args.purge:
+            service_uninstall(verbose=False)
             shutil.rmtree(GIT_DIR, ignore_errors=True)
             shutil.rmtree(GDRIVE_STORE, ignore_errors=True)
-    print("reset" + (" and purged local data" if args.purge else ""))
+            shutil.rmtree(BASELINE_DIR, ignore_errors=True)
+            try:
+                WATCH_STATUS.unlink()
+            except OSError:
+                pass
+    if args.purge:
+        print("reset and purged local stores "
+              f"(trash and conflict copies left in {to_tilde(DATA_DIR)})")
+    else:
+        print("reset")
 
 
 def cmd_add(args):
-    with OperationLock() as lock:
+    with OperationLock():
         state = load_state()
         target = expand(args.path)
         if not target.exists():
@@ -990,7 +2242,25 @@ def cmd_add(args):
         rel = home_rel(target)
         if is_secret(rel):
             sys.exit("refusing to sync a credentials path")
+        real = local_root(target)
+        for reserved, why in ((DATA_DIR, "the sync store"),
+                              (GIT_DIR, "the git backend"),
+                              (PLUGIN_DIR, "installed plugins")):
+            if real == reserved or reserved.is_relative_to(real):
+                sys.exit(f"refusing to sync {why} into itself")
+        for other, app in state["apps"].items():
+            # Two items holding the same path would fight over it every pass.
+            for existing in app.get("paths", []):
+                try:
+                    if home_rel(expand(existing)) == rel:
+                        sys.exit(f"already synced by {other} — "
+                                 f"change that one instead of adding a second")
+                except ValueError:
+                    continue
         cid = args.id or ("custom-" + rel.strip("/").replace("/", "-"))
+        note = "added by you"
+        if target.is_symlink():
+            note = f"added by you — symlinked to {real}"
         state["apps"][cid] = {
             "name": args.name or rel,
             "kind": "custom",
@@ -998,14 +2268,14 @@ def cmd_add(args):
             "target": args.target,
             "enabled": True,
             "risky": False,
-            "note": "added by you",
+            "note": note,
         }
         save_state(state)
         print(f"added {cid}")
 
 
 def cmd_remove(args):
-    with OperationLock() as lock:
+    with OperationLock():
         state = load_state()
         if args.id not in state["apps"]:
             sys.exit(f"unknown app: {args.id}")
@@ -1027,7 +2297,9 @@ def cmd_status(args):
 
 def cmd_which(args):
     for backend, path in (("git repo", GIT_DIR), ("git store", STORE),
-                          ("drive store", GDRIVE_STORE), ("state", STATE_FILE)):
+                          ("drive store", GDRIVE_STORE), ("state", STATE_FILE),
+                          ("baselines", BASELINE_DIR), ("trash", TRASH_DIR),
+                          ("conflicts", CONFLICTS_DIR)):
         print(f"{backend}: {to_tilde(path)}")
 
 
@@ -1037,7 +2309,39 @@ def cmd_repos(args):
 
 # --- entry -----------------------------------------------------------------
 
+# Flags and subcommands 0.1.0 accepted, and what to use instead. A sync tool
+# should not quietly ignore a flag someone typed expecting it to matter.
+LEGACY_FLAGS = {
+    "--download": "run `configsync download`, or just `configsync sync`, which does both sides",
+    "--deploy": "run `configsync deploy`, or just `configsync sync`",
+    "--delete": "run `configsync set-backend gdrive delete true|false`",
+    "--update": "it is always on: only files that changed on one side are copied",
+    "--auto": "run `configsync set-backend watch enabled true`",
+    "--interval": "run `configsync set-backend watch pull <minutes>`",
+    "--paths": "the paths live in `configsync state`",
+}
+
+LEGACY_COMMANDS = {
+    "set-gdrive": "run `configsync set-backend gdrive remote <folder>`",
+    "set-git": "run `configsync set-backend git remote <url>`",
+    "set-auto": "run `configsync set-backend watch enabled true|false`",
+    "panel-state": "run `configsync state`",
+    "pull": "run `configsync download`",
+    "push": "run `configsync deploy`",
+    "set-software": "run `configsync set-secrets <id> true` for key files",
+}
+
+
 def main(argv=None):
+    # 0.1.0 spelled several things differently. Say what replaced them instead
+    # of failing with argparse's "unrecognized arguments".
+    words = list(argv if argv is not None else sys.argv[1:])
+    if words and words[0] in LEGACY_COMMANDS:
+        sys.exit(f"{words[0]} was removed: {LEGACY_COMMANDS[words[0]]}")
+    for word in words:
+        flag = word.split("=", 1)[0]
+        if flag in LEGACY_FLAGS:
+            sys.exit(f"{flag} was removed: {LEGACY_FLAGS[flag]}")
     parser = argparse.ArgumentParser(prog="configsync", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1059,6 +2363,12 @@ def main(argv=None):
     p.add_argument("value")
     p.set_defaults(func=cmd_set_target)
 
+    p = sub.add_parser("set-secrets",
+                       help="allow key/token files inside one item (default: skipped)")
+    p.add_argument("id")
+    p.add_argument("value", choices=["true", "false"])
+    p.set_defaults(func=cmd_set_secrets)
+
     p = sub.add_parser("set-backend", help="configure a backend (remote, branch, ...)")
     p.add_argument("backend")
     p.add_argument("key")
@@ -1069,19 +2379,33 @@ def main(argv=None):
     p.add_argument("value", choices=["true", "false"])
     p.set_defaults(func=cmd_set_all)
 
-    p = sub.add_parser("sync", help="sync the enabled apps")
+    p = sub.add_parser("sync", help="sync the enabled apps (both directions)")
     p.add_argument("ids", nargs="*", help="only these app ids (default: all enabled)")
     p.add_argument("--only", choices=["git", "gdrive"])
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--prefer", choices=["local", "remote"],
+                   help="only decides a first-sync disagreement")
     p.set_defaults(func=cmd_sync)
 
-    p = sub.add_parser("download", help="bring the backends' files into the local store")
-    p.add_argument("ids", nargs="*")
-    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("watch", help="run the folder watcher (inotify + rsync)")
+    p.add_argument("--force", action="store_true", help="run even when watch is off")
+    p.add_argument("--once", action="store_true", help="one full pass, then exit")
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("service", help="manage the systemd user service")
+    p.add_argument("action", choices=["install", "uninstall", "status"])
+    p.set_defaults(func=cmd_service)
+
+    p = sub.add_parser("trash", help="list, restore or empty what a sync removed")
+    p.add_argument("action", choices=["list", "restore", "restore-all", "empty"],
+                   nargs="?", default="list")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_trash)
+
+    p = sub.add_parser("download", help="fetch the git backend into the local store")
     p.set_defaults(func=cmd_download)
 
-    p = sub.add_parser("deploy", help="write the local store into your home directory")
-    p.add_argument("ids", nargs="*")
+    p = sub.add_parser("deploy", help="write the backend copy into $HOME (recovery)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_deploy)
 
@@ -1105,6 +2429,8 @@ def main(argv=None):
 
     p = sub.add_parser("install-software", help="reinstall plugins and packages from the manifest")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--plan", action="store_true", help="print what would be installed")
+    p.add_argument("--yes", action="store_true", help="install without a terminal prompt")
     p.set_defaults(func=cmd_install_software)
 
     args = parser.parse_args(argv)
@@ -1112,13 +2438,16 @@ def main(argv=None):
         args.func = {"scan": cmd_scan, "state": cmd_state, "status": cmd_status,
                      "which": cmd_which}[args.cmd]
     try:
-        args.func(args)
+        result = args.func(args)
+        return result or 0
     except KeyboardInterrupt:
-        sys.exit(130)
+        return 130
+    except BrokenPipeError:
+        return 0
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
