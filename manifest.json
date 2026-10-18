@@ -6,7 +6,7 @@
   "author": "ryankuo",
   "license": "MIT",
   "homepage": "https://github.com/iamkuo/omarchy-configsync-plugin",
-  "description": "Detect installed apps and their config files, then sync the ones you choose across machines. Small configs go through a git repo; large personal files go through rsync to a Google Drive folder. A watcher keeps inotify watches on the enabled paths and runs rsync seconds after you stop editing. When the same file changed on two machines both versions are kept, removals move to a trash folder you can restore from, and secrets are never touched.",
+  "description": "Detect installed apps and their config files, then sync the ones you choose across machines. Small configs go through a git repo; large personal files go through rsync to a Google Drive folder. Watching uses Omarchy's own rsw watchers, one per path, with a periodic full pass for changes made on other machines. When the same file changed on two machines both versions are kept, removals move to a trash folder you can restore from, and secrets are never touched.",
   "kinds": [
     "bar-widget",
     "service"
@@ -19,7 +19,14 @@
     "displayName": "Config Sync",
     "description": "Pick which app configs and folders sync, and where they go",
     "category": "System",
-    "aliases": ["sync", "dotfiles", "config", "backup", "git", "gdrive"],
+    "aliases": [
+      "sync",
+      "dotfiles",
+      "config",
+      "backup",
+      "git",
+      "gdrive"
+    ],
     "allowMultiple": false,
     "defaultSection": "right"
   }

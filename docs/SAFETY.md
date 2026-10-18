@@ -18,8 +18,9 @@ against the two things that can go wrong with a sync tool: **losing a file** and
   `~/.config/omarchy/configsync.json` (settings and last result),
   `~/.config/omarchy/configsync/software.json` (the plugin/package manifest,
   which is meant to travel), the baseline and state files under
-  `~/.local/share/omarchy-configsync/`, and the systemd user unit when you ask
-  for it.
+  `~/.local/share/omarchy-configsync/`, and, when you ask it to, the two systemd
+  user units for the periodic pass. It also starts `rsw`-style watcher processes,
+  which are ordinary child processes of your session.
 
 It never runs as root, never edits files outside those paths, never installs
 anything without showing the plan first, and never unlinks a file: removals go
@@ -185,6 +186,38 @@ both), and only the emptied directories are pruned.
 - **Paths that no longer exist are skipped, not treated as emptied**, so a path
   on an unmounted disk cannot look like "everything was deleted".
 
+- **The change watcher is an rsw watcher, not a daemon of ours.** One
+  `inotifywait` + `rsync -a` loop per enabled path, in the shape Omarchy documents
+  in `omarchy.org/manual/shell-functions`: detached, marked `rsw-watch`, same
+  events, so it shows up in `lsw` and stops under `dsw`. It goes **one way only**
+  (local to backend) and its `rsync` has no `--delete`, so it can never delete
+  anything on either side; a removal here waits for the three-way pass, where it
+  can be checked against the other side.
+- **The watcher's copy carries the same exclusions as the pass.** `rsw` itself
+  takes exactly two arguments, so its `rsync` cannot be given `--exclude`, and a
+  verbatim copy would put caches, logs, `node_modules`, `.git` directories and
+  secret files into the backend — including the plugin's own machine-local
+  `configsync.json`. The loop is therefore the same except for the `--exclude`
+  arguments, built from the same pattern list the scan uses (`EXCLUDES` +
+  `SECRET_FILES`, minus the secret list for an item explicitly allowed to carry
+  secrets). `test_watcher_honours_the_exclusion_rules` holds that line.
+- **The fast path is allowed to be approximate; the pass is not.** rsync's quick
+  check is size + whole-second timestamp, so a same-size edit inside the same
+  second waits for the next pass — which compares nanoseconds, and content when
+  the stamps cannot settle it, before deciding anything. That is the same
+  division of labour as rsw, and `test_the_pass_catches_what_the_fast_path_can_miss`
+  proves the net is under it.
+- **`watch --stop` stops only our own watchers.** Ownership is decided by the
+  source path being one this plugin manages, read from the process table rather
+  than from anything we wrote down, so a watcher someone started for their own
+  work (`rsw ~/Work/app nyc-dev:Work/app`) is left alone. `--stop --all` is the
+  `dsw` behaviour: every watcher on the machine, and it says so.
+- **A watcher that dies is not silent.** `watch --ensure` — run by the pass
+  timer, by the panel's `⋯` menu, and by the shell service at login — restarts a
+  missing watcher and stops a stale one: one whose item was switched off or whose
+  backend moved. Status is read live from the process table, so the panel reports
+  what is actually running instead of what was last written down.
+
 ## 4. Still true, by design
 
 - **Timestamps are trusted** for the fast path (size + mtime), like rsync's
@@ -203,9 +236,10 @@ both), and only the emptied directories are pruned.
 - **FUSE and network mounts round timestamps**, so the Drive backend allows a
   2-second difference before calling a remote file changed. A change is caught
   as soon as the stamp drifts past that window, not lost.
-- **The systemd unit runs as your user**, with the same access as your shell. It
-  is `configsync watch` with no extra privilege; it exists to survive a shell
-  restart.
+- **The timer and the watchers run as your user**, with the same access as your
+  shell. The timer is `configsync watch --once` with no extra privilege, and its
+  only job is to survive a shell restart; the watchers are the same `rsw`
+  processes you would get by running `rsw` yourself.
 - **Nothing here defends against a hostile plugin manifest in your own plugin
   directory.** Omarchy plugins run unsandboxed inside the shell; that is the
   platform's design, not something this plugin can fix.
@@ -228,5 +262,9 @@ subprocess. The cases covering this document are the ones named
 `test_second_machine_pulls_instead_of_clobbering`,
 `test_dry_run_writes_no_state`, `test_same_size_edit_in_the_same_second_is_copied`,
 `test_restore_never_clobbers_a_newer_file`,
-`test_machine_state_file_is_not_synced`, `test_manifest_package_names_are_validated`
-and `test_add_refuses_the_store_and_secret_paths`.
+`test_machine_state_file_is_not_synced`, `test_manifest_package_names_are_validated`,
+`test_add_refuses_the_store_and_secret_paths`, `test_watcher_pushes_local_edits`,
+`test_watch_is_idempotent_and_stops_only_ours`,
+`test_watcher_honours_the_exclusion_rules`,
+`test_the_pass_catches_what_the_fast_path_can_miss` and
+`test_a_watcher_push_is_committed_by_the_next_pass`.

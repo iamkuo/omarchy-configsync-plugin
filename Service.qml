@@ -2,17 +2,18 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// The plugin's always-on half.
+// The plugin's always-on half — deliberately small.
 //
-// Watching is normally a systemd user service: the panel installs it when
-// Watch is switched on, and it keeps running across shell restarts. This
-// service is the fallback for a machine without a user session — it keeps
-// `configsync watch` alive as a child, restarts it if it dies, and stops it
-// when Watch is switched off. The CLI's own lock file means the two can never
-// both be doing the work, so a duplicate simply exits.
+// Watching is two things, and neither of them is this file:
+//   * the change watchers, which are Omarchy's own rsw processes: inotifywait
+//     plus `rsync -a` per path, listed by `lsw` and stopped by `dsw`;
+//   * a periodic full pass, which is a systemd user timer on a machine with a
+//     user session.
 //
-// It also gives the panel (and anything else) an IPC route to sync without
-// opening the popup.
+// This service exists for the machine that has no user session bus: it asks the
+// CLI to start the watchers when the shell comes up, and runs the same full pass
+// on a Qt timer instead of the systemd one. Everything it does is one CLI call,
+// so the work and the reporting stay in one place.
 Scope {
   id: root
 
@@ -24,8 +25,8 @@ Scope {
   readonly property string statePath: Quickshell.env("HOME") + "/.config/omarchy/configsync.json"
 
   property bool watchEnabled: false
-  property bool watchRunning: false
-  property bool serviceActive: false
+  property int pullMinutes: 10
+  property bool systemd: false
   property bool loaded: false
 
   function parseConfig() {
@@ -36,30 +37,26 @@ Scope {
       // An older state file has no `watch` key; its interval switch means the
       // same thing, and the CLI migrates it on the next write.
       root.watchEnabled = watch ? !!watch.enabled : !!(legacy && legacy.enabled)
+      root.pullMinutes = (watch && Number(watch.pullMinutes)) || 10
+      root.systemd = !!(watch && watch.systemd)
       root.loaded = true
     } catch (e) {
-      // No state file yet, or mid-write: leave the watcher off until it reads.
+      // No state file yet, or mid-read: leave things as they are.
     }
-    root.reconcile()
+    root.ensureWatchers()
   }
 
-  // Ensure exactly one watcher: ours, or the systemd one.
-  function reconcile() {
-    if (!root.loaded) return
-    var managedElsewhere = root.watchRunning || root.serviceActive
-    if (!root.watchEnabled || managedElsewhere) {
-      if (watcher.running) watcher.running = false
-      return
-    }
-    if (watcher.running) return
-    watcher.command = ["python3", root.scriptPath, "watch"]
-    watcher.running = true
+  // systemd owns the timer when it is there; without it, this service does.
+  function ensureWatchers() {
+    if (!root.loaded || !root.watchEnabled || root.systemd) return
+    ensureProc.command = ["python3", root.scriptPath, "watch", "--ensure"]
+    ensureProc.running = true
   }
 
-  function checkStatus() {
-    if (statusProc.running) return
-    statusProc.command = ["python3", root.scriptPath, "state"]
-    statusProc.running = true
+  function pullNow() {
+    if (pullProc.running) return
+    pullProc.command = ["python3", root.scriptPath, "watch", "--once"]
+    pullProc.running = true
   }
 
   function syncNow() {
@@ -77,59 +74,44 @@ Scope {
   }
 
   Process { id: syncProc }
+  Process { id: ensureProc }
 
-  // The fallback watcher. It runs until Watch is switched off, or until it
-  // finds that the systemd service already holds the lock.
+  // The full pass. systemd runs this too, and the CLI takes a lock, so a pass
+  // that starts while the other one is running simply reports that and exits.
   Process {
-    id: watcher
+    id: pullProc
     onExited: restartTimer.restart()
   }
 
-  Process {
-    id: statusProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try {
-          var d = JSON.parse(text)
-          var w = (d && d.watch) || {}
-          root.watchRunning = !!w.running
-          root.serviceActive = !!((w.service || {}).active)
-        } catch (e) {
-          // Leave the last reading; the next check is a minute away.
-        }
-        root.reconcile()
-      }
-    }
+  // One catch-up pass shortly after the shell starts, the way the systemd timer
+  // does at boot.
+  Timer {
+    interval: 45000
+    running: root.loaded && root.watchEnabled && !root.systemd
+    repeat: false
+    onTriggered: root.pullNow()
   }
 
   Timer {
-    id: statusTimer
-    interval: 60000
-    running: root.loaded
+    id: passTimer
+    interval: Math.max(1, root.pullMinutes) * 60000
+    running: root.loaded && root.watchEnabled && !root.systemd
     repeat: true
-    onTriggered: root.checkStatus()
+    onTriggered: root.pullNow()
   }
 
-  // A short delay before restarting a child that just exited, so a watcher
-  // that cannot start does not spin.
+  // A watcher that dies (its tree was removed, inotify gave up) is noticed on
+  // the next pass, which starts it again.
   Timer {
     id: restartTimer
-    interval: 30000
+    interval: 15000
     repeat: false
-    onTriggered: root.checkStatus()
-  }
-
-  Timer {
-    interval: 8000
-    running: true
-    repeat: false
-    onTriggered: root.checkStatus()
+    onTriggered: root.ensureWatchers()
   }
 
   IpcHandler {
     target: "configsync"
     function sync(): void { root.syncNow() }
-    function refresh(): void { root.checkStatus() }
+    function refresh(): void { root.parseConfig() }
   }
 }

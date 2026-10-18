@@ -24,6 +24,76 @@ GHOSTTY = ".config/ghostty/config"
 STORE_REL = ".local/share/omarchy-configsync/git/home"
 
 
+def wait_for(predicate, message="", timeout=30.0, interval=0.4):
+    """Spin until predicate() is true — watchers push asynchronously."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if predicate():
+                return
+        except OSError:
+            pass
+        time.sleep(interval)
+    raise AssertionError(message or "timed out waiting for the condition")
+
+
+def watchers() -> list[tuple[int, str]]:
+    """Every rsw watcher on the machine, the way `lsw` looks for them."""
+    out = subprocess.run(["pgrep", "-af", "rsw-watch "], text=True,
+                         stdout=subprocess.PIPE).stdout
+    found = []
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit():
+            found.append((int(pid), command))
+    return found
+
+
+def start_foreign_watcher(source: Path, destination: Path) -> None:
+    """A watcher this plugin did not start: the same shape rsw leaves behind."""
+    subprocess.run(["setsid", "--fork", "env", "bash", "-c",
+                    'while inotifywait -r -q -e modify,create "$1"; do :; done',
+                    "rsw-watch", str(source), str(destination)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=False)
+
+
+def watch_count(pid: int) -> int:
+    """How many inotify watches a process holds, straight from /proc."""
+    total = 0
+    for fdinfo in Path(f"/proc/{pid}/fdinfo").glob("*"):
+        try:
+            total += fdinfo.read_text().count("inotify wd:")
+        except OSError:
+            continue
+    return total
+
+
+def wait_for_watch(source: Path, timeout=30.0) -> None:
+    """Wait until inotify is really armed on `source`.
+
+    rsw syncs once, and only then starts inotifywait — and `-r` needs a moment
+    before its watches exist. A write that lands in either gap waits for the next
+    event, or for the next full pass, so a test that writes the moment the process
+    appears measures the gap instead of the feature. Count the watches in /proc
+    and write only once they are all there.
+    """
+    wanted = sum(1 for _ in os.walk(source))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = subprocess.run(["pgrep", "-af", "inotifywait"], text=True,
+                             stdout=subprocess.PIPE).stdout
+        for line in out.splitlines():
+            pid, _, command = line.strip().partition(" ")
+            if not pid.isdigit() or not command.rstrip().endswith(str(source)):
+                continue
+            if watch_count(int(pid)) >= wanted:
+                return
+        time.sleep(0.2)
+    raise AssertionError(f"inotify is not watching {source} yet")
+
+
+
 class Machine:
     """A fake $HOME plus the CLI calls that act on it."""
 
@@ -76,6 +146,11 @@ class ConfigSyncTest(unittest.TestCase):
         self.drive.mkdir()
 
     def tearDown(self):
+        # rsw watchers are detached, so they outlive the test unless we stop
+        # them; kill every one whose paths are inside this test's temp root.
+        for pid, command in watchers():
+            if str(self.root) in command:
+                subprocess.run(["kill", "--", f"-{pid}"], check=False)
         shutil.rmtree(self.root, ignore_errors=True)
 
     # -- helpers -----------------------------------------------------------
@@ -380,7 +455,7 @@ class ConfigSyncTest(unittest.TestCase):
                                                    "intervalMinutes": 30}}))
         state = a.state()
         self.assertTrue(state["watch"]["enabled"])
-        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["version"], 3)
 
     def test_state_file_keeps_a_backup(self):
         a = self.machine("a")
@@ -392,13 +467,21 @@ class ConfigSyncTest(unittest.TestCase):
 
     def test_watch_is_off_by_default_and_toggleable(self):
         a = self.machine("a")
+        a.write("Documents/notes.txt", "start\n")
         self.configure(a)
         state = a.state()
         self.assertFalse(state["watch"]["enabled"])
-        out = a.run("set-backend", "watch", "enabled", "true")
+        out = a.run("watch", "--on")
         self.assertIn("watch: on", out)
         self.assertTrue(a.state()["watch"]["enabled"])
-        self.assertIn("shell", out, "no systemd here, so it falls back to the shell")
+        self.assertEqual(a.state()["watch"]["watching"],
+                         a.state()["watch"]["expected"])
+        self.assertIn("shell", out, "no systemd here, so the shell runs the passes")
+
+        out = a.run("watch", "--off")
+        self.assertIn("watch: off", out)
+        self.assertFalse(a.state()["watch"]["enabled"])
+        self.assertEqual(a.state()["watch"]["watching"], 0)
 
     def test_service_install_without_systemd_reports_the_fallback(self):
         a = self.machine("a")
@@ -407,55 +490,106 @@ class ConfigSyncTest(unittest.TestCase):
         self.assertEqual(json.loads(a.run("service", "status"))["installed"], False)
 
     def test_watcher_pushes_local_edits(self):
+        # Same contract as rsw: one rsync at startup, then one per change.
         a = self.machine("a")
         a.write("Documents/notes.txt", "start\n")
         self.configure(a)
-        a.run("set-backend", "watch", "enabled", "true")
-        a.run("set-backend", "watch", "debounce", "1")
-        a.run("set-backend", "watch", "pull", "30")
+        a.run("watch", "--on")
+        wait_for(lambda: (self.drive / "Documents" / "notes.txt").exists(),
+                 "the watcher syncs once when it starts")
+        wait_for_watch(a.home / "Documents")
 
-        proc = subprocess.Popen([sys.executable, str(SCRIPT), "watch"],
-                                env=a.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True)
-        try:
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                if (self.drive / "Documents" / "notes.txt").exists():
-                    break
-                time.sleep(0.5)
-            self.assertTrue((self.drive / "Documents" / "notes.txt").exists(),
-                            "the startup pass should push what is there")
+        a.write("Documents/fresh.txt", "written while watching\n")
+        wait_for(lambda: (self.drive / "Documents" / "fresh.txt").exists(),
+                 "inotify picks a new file up within seconds")
 
-            a.write("Documents/fresh.txt", "written while watching\n")
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                if (self.drive / "Documents" / "fresh.txt").exists():
-                    break
-                time.sleep(0.5)
-            self.assertTrue((self.drive / "Documents" / "fresh.txt").exists(),
-                            "inotify should pick the new file up within seconds")
-            # Read the live status while the watcher is still up.
-            status = a.state()["watch"]
-        finally:
-            proc.terminate()
-            proc.wait(timeout=15)
-        self.assertTrue(status["running"], "the watcher reports itself as running")
-        self.assertIn(status["mode"], ("inotify", "poll"))
+        view = a.state()["watch"]
+        self.assertEqual(view["watching"], view["expected"])
+        self.assertEqual(view["expected"], 2, "one watcher per enabled path")
+        self.assertTrue(all(w["mine"] for w in view["watchers"]))
+        self.assertIn("~/Documents", [w["source"] for w in view["watchers"]])
 
-    def test_only_one_watcher_runs(self):
+    def test_watch_is_idempotent_and_stops_only_ours(self):
         a = self.machine("a")
+        a.write("Documents/notes.txt", "start\n")
         self.configure(a)
-        a.run("set-backend", "watch", "enabled", "true")
-        first = subprocess.Popen([sys.executable, str(SCRIPT), "watch"],
-                                 env=a.env, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True)
-        try:
-            time.sleep(3)
-            out = a.run("watch", check=False)
-            self.assertIn("already running", out)
-        finally:
-            first.terminate()
-            first.wait(timeout=15)
+        a.run("watch", "--on")
+        out = a.run("watch", "--ensure")
+        self.assertIn("already being watched", out)
+        self.assertEqual(a.state()["watch"]["watching"],
+                         a.state()["watch"]["expected"])
+
+        # Somebody else's watcher, started the way rsw starts one. Counts are
+        # deltas: the machine may already have watchers of its own.
+        other = self.root / "elsewhere"
+        other.mkdir()
+        before = a.state()["watch"]["others"]
+        start_foreign_watcher(other, self.drive / "elsewhere")
+        wait_for(lambda: a.state()["watch"]["others"] == before + 1,
+                 "the foreign watcher is listed too")
+
+        a.run("watch", "--stop")
+        self.assertEqual(a.state()["watch"]["watching"], 0)
+        self.assertEqual(a.state()["watch"]["others"], before + 1,
+                         "stopping ours must leave everyone else's alone")
+        a.run("watch", "--stop", "--all")      # dsw behaviour, on request
+        self.assertEqual(a.state()["watch"]["others"], 0)
+
+    def test_watcher_honours_the_exclusion_rules(self):
+        # rsw's own loop is `rsync -a` with no excludes. The watcher runs the same
+        # loop with this plugin's filters, so a cache or a secret that the scan
+        # refuses to carry cannot ride along on the fast path either.
+        a = self.machine("a")
+        a.write(".config/ghostty/config", "font-size = 14\n")
+        a.write(".config/ghostty/Cache/blob", "junk\n")
+        a.write(".config/ghostty/credentials", "token\n")
+        a.write(".config/ghostty/id_rsa", "key\n")
+        self.configure(a)
+        a.run("watch", "--on")
+        a.run("sync")
+        wait_for_watch(a.home / ".config" / "ghostty")
+        a.write(".config/ghostty/new.conf", "fresh\n")
+
+        def copied(rel):
+            return (a.store(".config/ghostty") / rel).exists()
+
+        wait_for(lambda: copied("new.conf"),
+                 "the watcher copies an ordinary new file")
+        for rel in ("Cache/blob", "credentials", "id_rsa"):
+            self.assertFalse(copied(rel), f"{rel} must not reach the backend")
+
+    def test_a_watcher_push_is_committed_by_the_next_pass(self):
+        # The watcher copies into the store; the pass is what commits and pushes
+        # it, so a change made here reaches the other machine from either half.
+        a = self.machine("a")
+        a.write(GHOSTTY, "one\n")
+        self.configure(a)
+        a.run("watch", "--on")
+        a.run("sync")
+        wait_for_watch(a.home / ".config" / "ghostty")
+        a.write(GHOSTTY, "two and longer\n")
+        wait_for(lambda: a.store(GHOSTTY).read_text() == "two and longer\n",
+                 "the watcher copies a local edit into the store")
+        a.run("watch", "--once")
+        self.assertEqual(self.store_show(GHOSTTY), "two and longer\n")
+
+    def test_the_pass_catches_what_the_fast_path_can_miss(self):
+        # rsw's rsync skips a file whose size and whole-second mtime are
+        # unchanged, so a same-size edit saved inside the same second does not
+        # travel on the fast path. The pass compares nanoseconds and content, so
+        # it does — that is the division of labour, and it is worth pinning down.
+        a = self.machine("a")
+        a.write(GHOSTTY, "one\n")
+        self.configure(a)
+        a.run("watch", "--on")
+        a.run("sync")
+        wait_for_watch(a.home / ".config" / "ghostty")
+        a.write(GHOSTTY, "two\n")          # same size, same second
+        time.sleep(2)
+        out = a.run("watch", "--once")
+        self.assertEqual(a.read(GHOSTTY), "two\n")
+        self.assertEqual(self.store_show(GHOSTTY), "two\n",
+                         f"the pass should carry it: {out}")
 
 
 if __name__ == "__main__":

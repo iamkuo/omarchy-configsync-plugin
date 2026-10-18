@@ -7,9 +7,9 @@ config in your home directory, and syncs the ones you choose across machines.
   own settings, then lists them with a switch each.
 - **Choose a backend per item** — small configs go through a **git repo**;
   large or personal trees go through **rsync** to a **Google Drive** folder.
-- **Watched** — one switch turns on a watcher: inotify notices a local edit and
-  rsync copies it across a few seconds after you stop typing, with a slower
-  periodic pass for changes made on other machines.
+- **Watched** — one switch starts Omarchy's own `rsw` watcher per path, so a
+  local edit is copied across the moment it lands, with a periodic full pass for
+  the changes made on other machines.
 - **Nothing is lost** — a file edited on two machines keeps **both** versions, a
   file removed on one machine is only removed elsewhere when nothing changed
   there, and it goes to a **trash folder** you can restore from.
@@ -86,38 +86,56 @@ Deliberate, because each one is a way to lose work by pressing the wrong thing:
 
 ## The watcher
 
-One switch, in the panel footer:
+One switch, in the panel footer. It does two things, and the first one is
+Omarchy's own:
+
+**The change watchers are rsw watchers.** Omarchy ships `rsw <source>
+<destination>` (`omarchy.org/manual/shell-functions`): a detached `inotifywait`
++ `rsync -a` loop, listed by **`lsw`** and stopped by **`dsw`**. The plugin
+starts one per enabled path — local folder to its backend — so:
 
 ```bash
-configsync set-backend watch enabled true
-configsync set-backend watch debounce 4      # seconds of quiet before pushing
-configsync set-backend watch pull 10         # minutes between full passes
+lsw                 # the same list, from your shell
+configsync watch    # pid: source -> destination, and which ones are ours
 ```
 
-When Watch is on:
+Same process, same marker, same events, same one-way `rsync -a` — so `dsw` stops
+our watchers like any other, they survive the shell exiting, and anyone who knows
+`rsw` already knows what this does. One difference, and it is deliberate: `rsw`
+takes two arguments and no flags, so its `rsync` has **no exclusions at all**.
+The watcher the plugin starts runs the same loop with the same `--exclude`
+patterns the scan uses, because otherwise a browser cache, a `node_modules`
+tree or a `credentials` file would ride the fast path into your Drive folder.
+(The `rsync` line is the only difference; see `fresh_loop()` in the CLI.)
 
-- **inotify** watches every enabled path. Local changes are collected and pushed
-  a few seconds (default 4) after the last one, so a save storm becomes one rsync
-  pass.
-- A **full pass** runs every `pull` minutes (default 10) and once at login. This
-  is what brings back changes made on other machines — inotify cannot see those,
-  so the two mechanisms work together.
-- The slower pass is also what pushes anything the fast path deferred, such as a
-  deletion (which needs the three-way comparison, not a single file).
+The watcher only ever copies **local to backend**, and its rsync has no
+`--delete`, so it can add or update a file but it can never remove one, on
+either side. Removals wait for the three-way pass below, which knows whether the
+other side changed.
 
-The watcher runs as a **systemd user service** (`configsync-watch.service`,
-installed by `configsync service install`). That is how it survives a shell
-restart, and it is the only way it keeps working when no shell is running. With
-no user session bus available it falls back to a child process inside the shell
-service, and a lock file guarantees the two can never both be working.
+**The full pass is `configsync watch --once`**, run by a systemd user timer
+(`configsync-watch.timer`: 45s after login, every `pull` minutes — 10 by
+default — and once more a minute after you switch watching on). That pass is
+what pulls changes made on other machines (inotify cannot see those), commits
+and pushes what the watchers copied into the git store, and propagates
+deletions. With no systemd user session, `Service.qml` runs the same command on
+a Qt timer instead, and starts the watchers when the shell comes up.
 
 ```bash
-configsync service status     # installed? enabled? active? plus the unit's state
-configsync service install    # write and start the systemd user unit
+configsync watch                 # what is watching, and the switch state
+configsync watch --on | --off    # the panel's switch
+configsync watch --ensure        # start what is missing, stop what is stale
+configsync watch --stop          # stop ours only
+configsync watch --stop --all    # stop every watcher, like dsw
+configsync watch --once          # one full pass (what the timer runs)
+configsync watch --status        # JSON: watchers, timer, last pass
+configsync service status        # is the timer installed, enabled, active
+configsync service install       # write and start the timer units
 configsync service uninstall
-configsync watch              # run a watcher in the foreground (Ctrl+C to stop)
-configsync watch --once       # one full pass, useful in scripts and timers
 ```
+
+The switch is one command in either direction, so a stale watcher is easy to
+fix: the panel's `⋯` menu has **Re-arm watchers**, which is `watch --ensure`.
 
 ## What happens when both machines change the same file
 
@@ -164,9 +182,23 @@ every local file that differed is kept under
 - **The Drive backend tolerates timestamp rounding** (2 seconds), because FUSE
   and network mounts round them. A same-size edit is then noticed as soon as the
   stamp drifts past that window, not lost.
-- **The watcher falls back to polling** (`configsync state` shows
-  `"mode": "poll"`) if inotify watches cannot be added, and does a full pass
-  every `pull` minutes either way.
+- **A watcher copies; it never deletes.** That is rsw's `rsync -a` with no
+  `--delete`, and it is deliberate: a removal here has to be checked against the
+  other side first, so removals only ever happen in a full pass.
+- **The fast path is rsync's quick check** — size, and a timestamp compared in
+  whole seconds — exactly like rsw. A file edited to the *same size* inside the
+  *same second* as the last copy therefore does not travel on the fast path; the
+  next full pass compares nanoseconds and, when needed, content, so it is carried
+  then. Anything else (a new file, a normal save) goes across in the moment.
+- **The watcher syncs once, then watches.** Those are two steps, so a write that
+  lands in the moment between them is not seen until the next change — or the
+  next full pass, which is never more than `pull` minutes away. Deleting a
+  watched folder makes inotifywait exit; `watch --ensure` (the `⋯` menu, or the
+  timer's `ExecStartPre`) starts it again.
+- **inotify watches are per-path, not free.** Watching a very large tree can
+  exceed `fs.inotify.max_user_watches`; inotifywait then reports the error and
+  the watcher stops, and the slow pass becomes the only sync until you re-arm it.
+  Omarchy already raises that limit in `etc/sysctl.d/90-omarchy-file-watchers.conf`.
 - **Nothing is encrypted by this plugin.** Your configs go to your git host and
   your Drive folder, where they are readable by whoever can read those. Use a
   private repository.
@@ -208,7 +240,7 @@ configsync set-enabled <id> true|false
 configsync set-target  <id> git|gdrive|none
 configsync set-secrets <id> true|false
 configsync sync [--only git|gdrive] [--dry-run] [--prefer local|remote] [id ...]
-configsync watch [--once] [--force]
+configsync watch [--on|--off|--ensure|--stop [--all]|--once|--status]
 configsync service status|install|uninstall
 configsync add <path> [--name N] [--target git|gdrive]
 configsync remove <id>                 # delete a custom path, or hide a detected one
@@ -251,7 +283,7 @@ under a second. **Refresh** rescans; it also runs when the tab is opened.
 | `panel/AppCell.qml` | One row in the item list |
 | `panel/RepoCell.qml` | One row in the repos list |
 | `panel/Presentation.js` | Tile colours and backend labels |
-| `Service.qml` | Keeps a watcher alive when there is no systemd user service |
+| `Service.qml` | The no-systemd fallback: starts the watchers, runs the pass |
 | `bin/configsync` | The CLI: reconciler, watcher, service, software manifest |
 | `tests/test_configsync.py` | End-to-end tests over two fake machines |
 | `docs/SAFETY.md` | What the plugin is allowed to touch, and why |
@@ -280,6 +312,8 @@ pushing a file it noticed.
 ## Upgrading from 0.1.0
 
 Run `configsync scan` once. The interval **Auto sync** setting is migrated to the
-watcher, and the old flag forms (`sync --download`, `set-gdrive`, `set-git`,
+watcher's switch (which now starts Omarchy's `rsw` watchers and enables the pass
+timer), the old `watch debounce` setting is gone — the watcher is rsw, which has
+no debounce — and the old flag forms (`sync --download`, `set-gdrive`, `set-git`,
 `set-auto`, `panel-state`, `--delete`, …) were replaced by the subcommands above;
 using one prints the replacement.

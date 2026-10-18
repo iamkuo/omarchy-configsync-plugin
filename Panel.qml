@@ -89,11 +89,16 @@ Panel {
 
   readonly property string watchLine: {
     if (!root.watchOn) return "Watching off — sync runs when you press Sync now"
-    if (!root.watchInfo.running) return "⚠  Watching is on but the watcher is not running"
+    var watching = root.watchInfo.watching || 0
+    var expected = root.watchInfo.expected || 0
+    if (watching < expected) {
+      return "⚠  " + watching + " of " + expected + " path(s) watched · ⋯ → Re-arm watchers"
+    }
+    if (!expected) return "Watching on — nothing to watch yet"
     var svc = root.watchInfo.service || ({})
-    var how = root.watchInfo.mode === "inotify" ? "inotify" : "polling"
-    var where = svc.active ? "systemd service" : "inside the shell"
-    return "Watching " + (root.watchInfo.trees || 0) + " path(s) · " + how + " · " + where
+    var where = svc.active ? "full pass every " + (root.watchInfo.pullMinutes || 10) + " min"
+                           : "passes run inside the shell"
+    return "Watching " + watching + " path(s) with rsw · " + where
   }
 
   readonly property string backendsSummary: {
@@ -225,7 +230,12 @@ Panel {
   }
 
   function toggleWatch() {
-    root.run(["set-backend", "watch", "enabled", root.watchOn ? "false" : "true"])
+    // Starts or stops the rsw watchers and the pass timer in one step.
+    root.run(["watch", root.watchOn ? "--off" : "--on"])
+  }
+
+  function rearmWatchers() {
+    root.run(["watch", "--ensure"])
   }
 
   function resetPlugin() {
@@ -454,6 +464,21 @@ Panel {
               accent: Color.accent
               fontFamily: root.contentFontFamily
               onClicked: { overflowMenu.close(); root.requestSoftwarePlan() }
+            }
+
+            Button {
+              text: "Re-arm watchers"
+              tooltipText: "Start any rsw watcher that is missing, stop stale ones"
+              enabled: !root.busy && root.watchOn
+              leftAlign: true
+              Layout.fillWidth: true
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(5)
+              foreground: root.contentForeground
+              accent: Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: { overflowMenu.close(); root.rearmWatchers() }
             }
 
             Rectangle {
