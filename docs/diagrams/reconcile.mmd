@@ -1,0 +1,38 @@
+flowchart TD
+  Start(["One path inside a pair:<br/>local copy, backend copy, baseline from last pass"])
+
+  Filter{"Excluded or secret?<br/>EXCLUDES, SECRET_FILES,<br/>SECRETS subtree"}
+  Ignore(["Invisible on both sides:<br/>not copied, not pulled,<br/>not reported, not deleted"])
+  Start --> Filter
+  Filter -->|"yes"| Ignore
+  Filter -->|"no"| Same
+
+  Same{"Local and backend identical?<br/>size plus nanosecond mtime,<br/>content when that cannot settle it"}
+  Nothing(["Nothing to do"])
+  Same -->|"yes"| Nothing
+
+  Same -->|"no"| Changed{"Which side differs<br/>from the baseline?"}
+
+  Changed -->|"local only"| Push(["Copy local to backend"])
+  Changed -->|"backend only"| Pull(["Copy backend to local"])
+  Changed -->|"neither side has it"| New(["New file: copy it<br/>to the side that lacks it"])
+  Changed -->|"both, and differently"| Conflict(["Keep both:<br/>the winner lands in place,<br/>the other side's version is kept<br/>beside it, named for its machine"])
+
+  Changed -->|"local deleted"| DelLocal{"Backend changed too?"}
+  DelLocal -->|"no"| TrashRemote(["Move the backend copy<br/>to the trash"])
+  DelLocal -->|"yes"| Conflict
+  Changed -->|"backend deleted"| DelRemote{"Local changed too?"}
+  DelRemote -->|"no"| TrashLocal(["Move the local copy<br/>to the trash"])
+  DelRemote -->|"yes"| Conflict
+
+  Push --> Copy
+  Pull --> Copy
+  New --> Copy
+  Conflict --> Copy
+  Copy["rsync with the planned names only<br/>--ignore-times, --files-from"]
+  TrashRemote --> Done
+  TrashLocal --> Done
+  Nothing --> Done
+  Ignore --> Done
+  Copy --> Done
+  Done(["Baseline updated for what moved<br/>trash keeps every removal"])

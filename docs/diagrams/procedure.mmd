@@ -1,0 +1,55 @@
+flowchart TD
+  A(["Plugin installed<br/>manifest.json, QML panel, bin/configsync"])
+
+  subgraph S1["1. Detection - what could be synced"]
+    B["Walk ~/.config, dotfiles,<br/>common folders, Omarchy dirs"]
+    C["SECRETS paths are never listed<br/>~/.ssh, ~/.gnupg, keyrings, gh, aws"]
+    D["RISKY apps are listed but stay off,<br/>with the reason on the row"]
+    B --> C --> D
+  end
+  A --> B
+
+  E["2. You pick: enable an item<br/>and choose its backend"]
+  F["3. The item becomes a pair<br/>local base to backend base"]
+  D --> E --> F
+
+  subgraph S2["4a. Fast path - the Watch switch"]
+    G["watch --on<br/>git pairs: make sure the store repo exists"]
+    I["One rsw-shaped watcher per pair<br/>setsid, marker rsw-watch"]
+    J["inotifywait -r -q<br/>modify, create, delete, move"]
+    K["rsync -a plus the plugin's --exclude set<br/>one way, never --delete"]
+    G --> I --> J --> K
+  end
+  F --> G
+
+  subgraph S3["4b. Full pass - timer or shell timer"]
+    H["configsync-watch.timer<br/>45s after login, then every pull minutes"]
+    H2["configsync watch --once<br/>the same command the panel can run"]
+    H --> H2
+  end
+  F --> H
+
+  L[("Backends<br/>git remote / Drive folder")]
+  K -->|"a local edit lands at once"| L
+
+  subgraph S4["5. The three-way pass, one pair at a time"]
+    N["Take the run lock"]
+    O["Get the backend to its latest:<br/>git fetch and rebase the store<br/>Drive folder configured?"]
+    P["Scan the local side, filtered"]
+    Q["Scan the backend side, same filters"]
+    R["Load the baseline recorded last pass"]
+    S["make_plan: local vs backend vs baseline"]
+    T["Apply: rsync copies, conflict copies,<br/>removals moved to the trash"]
+    U["git pairs: add, commit, push"]
+    V["Save the new baseline, counts, last run"]
+    N --> O --> P --> Q --> R --> S --> T --> U --> V
+  end
+  H2 --> N
+  L -->|"what the other machine wrote"| Q
+  V -->|"pull results, new commits"| L
+
+  M["The other machine runs the same pass<br/>git: push and pull | Drive: one shared folder"]
+  L <--> M
+
+  W["6. Panel and CLI report what moved<br/>trash: list, restore, empty"]
+  V --> W
