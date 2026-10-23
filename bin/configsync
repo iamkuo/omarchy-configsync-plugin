@@ -616,13 +616,21 @@ class Plan:
         self.conflicts: list[str] = []      # changed on both sides
         self.kept: list[str] = []           # deletion not propagated
         self.same: list[str] = []
+        self.overwrite_local: list[str] = []  # a resume: backend version wins
 
 
 def make_plan(local: dict, remote: dict, base_local: dict, base_remote: dict,
               delete: bool, prefer: str | None = None,
               remote_slack: int = DRIVE_TOLERANCE,
-              content_equal=None) -> Plan:
-    """Three-way compare. `prefer` only decides a no-baseline disagreement."""
+              content_equal=None, force: str | None = None,
+              unpublished: bool = False) -> Plan:
+    """Three-way compare. `prefer` only decides a no-baseline disagreement.
+
+    `force="backend"` is a resume: the baseline is ignored and the backend — the
+    snapshot just checked out — wins every disagreement. `unpublished` says the
+    remote never accepted what the last pass reconciled, so a remote-side change
+    is kept as a conflict copy instead of overwriting local work.
+    """
     plan = Plan()
 
     def identical(rel: str, a, b) -> bool:
@@ -646,6 +654,23 @@ def make_plan(local: dict, remote: dict, base_local: dict, base_remote: dict,
         bl = base_local.get(rel)
         br = base_remote.get(rel)
         known = rel in base_local or rel in base_remote
+
+        if force == "backend":
+            # A resume. The snapshot is the truth, so every difference resolves
+            # its way: what the snapshot has is written back, what it does not
+            # have is removed, and a differing local file is moved to the trash
+            # rather than dropped, which keeps the restore reversible.
+            if l is None and r is None:
+                continue
+            if l is None:
+                plan.pull.append(rel)
+            elif r is None:
+                plan.delete_local.append(rel)
+            elif identical(rel, l, r):
+                plan.same.append(rel)
+            else:
+                plan.overwrite_local.append(rel)
+            continue
 
         if l is not None and r is not None:
             if not known:
@@ -672,14 +697,21 @@ def make_plan(local: dict, remote: dict, base_local: dict, base_remote: dict,
             elif local_changed:
                 plan.push.append(rel)
             elif remote_changed:
-                plan.pull.append(rel)
+                # With content still unpublished the remote's side of the
+                # baseline is not trustworthy: keep both rather than let the
+                # remote's copy replace local work it has never seen.
+                (plan.conflicts if unpublished else plan.pull).append(rel)
             else:
                 plan.same.append(rel)
             continue
 
         if l is not None and r is None:
             # The backend copy is gone: it was deleted on the other machine.
-            if known and bl is not None and same(l, bl, LOCAL_TOLERANCE):
+            if unpublished:
+                # The remote's side of the baseline cannot be trusted yet, so
+                # keep the local file and publish it again rather than removing it.
+                plan.push.append(rel)
+            elif known and bl is not None and same(l, bl, LOCAL_TOLERANCE):
                 (plan.delete_local if delete else plan.kept).append(rel)
             else:
                 plan.push.append(rel)
@@ -774,25 +806,39 @@ def baseline_path(key: str) -> Path:
     return BASELINE_DIR / f"{slug(key)}.json"
 
 
-def load_baseline(key: str) -> tuple[dict, dict]:
+def baseline_exists(key: str) -> bool:
+    return baseline_path(key).exists()
+
+
+def load_baseline(key: str) -> tuple[dict, dict, bool]:
+    """What both sides held after the last pass, and whether it was published.
+
+    `unpublished` means the last pass reconciled content that the remote never
+    accepted (the push was refused, or the remote was unreachable). While that is
+    true the next pass is deliberately conservative: it keeps both versions
+    instead of letting the remote's copy win, because the local side holds
+    content the remote has never seen.
+    """
     path = baseline_path(key)
     if not path.exists():
-        return {}, {}
+        return {}, {}, False
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
-        return {}, {}
+        return {}, {}, False
     def to_fp(raw):
         return {k: tuple(v) for k, v in raw.items()}
-    return to_fp(data.get("local", {})), to_fp(data.get("remote", {}))
+    return (to_fp(data.get("local", {})), to_fp(data.get("remote", {})),
+            bool(data.get("unpublished")))
 
 
-def save_baseline(key: str, local: dict, remote: dict) -> None:
+def save_baseline(key: str, local: dict, remote: dict, published: bool = True) -> None:
     BASELINE_DIR.mkdir(parents=True, exist_ok=True)
     path = baseline_path(key)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps({
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "unpublished": not published,
         "local": {k: list(v) for k, v in local.items()},
         "remote": {k: list(v) for k, v in remote.items()},
     }, indent=1) + "\n")
@@ -805,14 +851,19 @@ class PairResult:
         self.conflicts: list[str] = []
         self.notes: list[str] = []
         self.errors: list[str] = []
+        # (key, local, remote) for a git pair: the caller saves it once the
+        # content has actually been published, never before.
+        self.pending_baseline = None
 
 
 def reconcile_pair(key: str, label: str, local: Path, remote: Path,
                    patterns, delete: bool, dry: bool = False,
                    prefer: str | None = None,
+                   force: str | None = None,
                    allow_secrets: bool = False,
                    single_name: str | None = None,
-                   remote_slack: int = DRIVE_TOLERANCE) -> PairResult:
+                   remote_slack: int = DRIVE_TOLERANCE,
+                   defer_baseline: bool = False) -> PairResult:
     """Bring one local path and its backend copy back into agreement."""
     result = PairResult()
     local = Path(local)
@@ -828,8 +879,8 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
             f"{kind(rfp)} — leaving both alone")
         return result
 
-    base_local, base_remote = load_baseline(key)
-    first_sync = not base_local and not base_remote
+    base_local, base_remote, unpublished = load_baseline(key)
+    first_sync = not baseline_exists(key)
 
     local_base, remote_base, is_dir = pair_bases(local, remote)
     name = single_name or local.name
@@ -840,7 +891,8 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
         local_scan = {name: lfp} if lfp is not None else {}
         remote_scan = {name: rfp} if rfp is not None else {}
     plan = make_plan(local_scan, remote_scan, base_local, base_remote, delete, prefer,
-                     remote_slack=remote_slack,
+                     remote_slack=remote_slack, force=force,
+                     unpublished=unpublished,
                      content_equal=lambda rel: (
                          (left := digest(local_base / rel)) is not None
                          and left == digest(remote_base / rel)))
@@ -854,8 +906,10 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
             print(f"  would delete {rel}")
         for rel in plan.conflicts:
             print(f"  conflict {rel}")
+        for rel in plan.overwrite_local:
+            print(f"  would restore {rel}")
         result.pushed = len(plan.push)
-        result.pulled = len(plan.pull)
+        result.pulled = len(plan.pull) + len(plan.overwrite_local)
         result.deleted = len(plan.delete_remote) + len(plan.delete_local)
         result.conflicts = list(plan.conflicts)
         result.kept = len(plan.kept)
@@ -890,10 +944,17 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
     push_rels = list(plan.push)
     if not first_sync:
         push_rels += [rel for rel in plan.conflicts if (local_base / rel).exists()]
+    # A resume overwrites the local copy, so what is being replaced goes to the
+    # trash first: a restore you regret is still a restore you can undo.
+    for rel in plan.overwrite_local:
+        target = local_base / rel
+        if target.exists():
+            trash(target, rel, "local", key)
+    pull_rels = list(plan.pull) + list(plan.overwrite_local)
     rsync_copy(local_base, remote_base, push_rels + conflict_copies)
-    rsync_copy(remote_base, local_base, plan.pull)
+    rsync_copy(remote_base, local_base, pull_rels)
     result.pushed += len(push_rels) + len(conflict_copies)
-    result.pulled += len(plan.pull)
+    result.pulled += len(pull_rels)
     result.conflicts = list(plan.conflicts)
 
     # 3. Deletions, to the trash, never unlinked.
@@ -920,7 +981,7 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
         for rel in push_rels:
             fp = local_scan.get(rel) or fingerprint(local_base / rel)
             new_local[rel] = new_remote[rel] = fp
-        for rel in plan.pull:
+        for rel in list(plan.pull) + list(plan.overwrite_local):
             fp = remote_scan.get(rel) or fingerprint(remote_base / rel)
             new_local[rel] = new_remote[rel] = fp
         for rel in conflict_copies:
@@ -941,7 +1002,13 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
                     new_local[parent] = ("d",)
                     new_remote[parent] = ("d",)
                 parent = str(Path(parent).parent)
-        save_baseline(key, new_local, new_remote)
+        if defer_baseline:
+            # The caller saves it once the push has landed. A baseline recorded
+            # for content the remote never accepted would make the next pass read
+            # the local change as a revert by the other machine.
+            result.pending_baseline = (key, new_local, new_remote)
+        else:
+            save_baseline(key, new_local, new_remote)
     return result
 
 
@@ -1233,54 +1300,246 @@ def ensure_git_repo(state) -> str:
     return remote
 
 
-def git_prepare(state) -> None:
-    """Get the store to the remote's latest before comparing.
+def git_fetch_reset(state) -> str:
+    """Bring the store to exactly what the remote holds — no merge, no rebase.
 
-    Doing this first is what stops a fresh machine from pushing its own default
-    configs over the real ones: the store already holds the setup being
-    restored, so the reconciler sees those files as already correct.
+    Git is transport here, not the decision maker: the reconciler owns what the
+    content should be, so nothing is ever merged by git. `reset --hard` makes the
+    store's tree the remote's tree, including the files the remote no longer has,
+    which is what lets the three-way compare read a removal as a removal. A
+    watcher copy that landed since the last pass survives as an untracked file:
+    it came from the local side, which this pass scans anyway.
     """
     remote = state["git"].get("remote", "").strip()
     if not remote:
-        return
+        return "local only: the store is the backend"
     branch = state["git"]["branch"]
-    run(["git", "fetch", "-q", "origin"], cwd=GIT_DIR, check=False)
-    has_remote = run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"],
-                     cwd=GIT_DIR, check=False).returncode == 0
-    if not has_remote:
-        return
-    if not _git(GIT_DIR, "rev-parse", "HEAD"):
-        run(["git", "checkout", "-q", "-B", branch, f"origin/{branch}"], cwd=GIT_DIR)
-        return
-    # Uncommitted leftovers from an interrupted pass would be thrown away by a
-    # checkout; commit them first so nothing is lost.
-    if _git(GIT_DIR, "status", "--porcelain"):
-        run(["git", *git_identity(state), "commit", "-q", "-am",
-             "configsync: recovered uncommitted store changes"], cwd=GIT_DIR)
-    rebase = run(["git", *git_identity(state), "rebase", "-q", f"origin/{branch}"],
-                 cwd=GIT_DIR, check=False)
-    if rebase.returncode != 0:
-        run(["git", "rebase", "--abort"], cwd=GIT_DIR, check=False)
-        raise RuntimeError(
-            "conflict with the remote — the same file changed on both sides. "
-            "Resolve it in the git backend repo and sync again.")
+    if not _git(GIT_DIR, "remote", "get-url", "origin"):
+        return "no remote"
+    reached = run(["git", "fetch", "-q", "origin", branch], cwd=GIT_DIR,
+                  check=False).returncode == 0
+    note = "" if reached else "could not reach the remote — using the last known state"
+    if not _git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}"):
+        return note or "the remote has nothing yet"
+    run(["git", "reset", "-q", "--hard", f"origin/{branch}"], cwd=GIT_DIR)
+    return note
 
 
-def git_commit_push(state) -> str:
-    if not (GIT_DIR / ".git").exists():
-        return ""
-    run(["git", "add", "-A"], cwd=GIT_DIR)
-    if _git(GIT_DIR, "status", "--porcelain"):
-        msg = f"configsync {socket.gethostname()} {time.strftime('%Y-%m-%d %H:%M')}"
-        run(["git", *git_identity(state), "commit", "-q", "-m", msg], cwd=GIT_DIR)
+def roll_message(state, report=None, subject: str | None = None) -> str:
+    """The one line the rolling commit carries."""
+    when = time.strftime("%Y-%m-%d %H:%M")
+    if subject:
+        return f"{subject} · {when}"
+    if report is not None:
+        moved = report.pushed + report.pulled + report.deleted
+        if moved:
+            return (f"configsync {hostname()} · {when} · {moved} file(s) · "
+                    f"{report.pushed} sent, {report.pulled} received, "
+                    f"{report.deleted} removed")
+    return f"configsync {hostname()} · {when}"
+
+
+def git_roll(state, message: str) -> tuple[bool, str]:
+    """Fold the store into the single rolling commit, then publish it.
+
+    The branch holds exactly one commit, always: every pass rewrites it, which is
+    what keeps `git log` readable. Snapshots (tags) are the only points that are
+    never rewritten. Publishing rewrites the remote's tip too, so the push is
+    guarded with --force-with-lease — if another machine pushed after our fetch,
+    the push is refused and the next pass reconciles against that content instead.
+
+    Returns (published, note). `published` decides whether a baseline may advance:
+    recording one for content the remote never accepted would make the next pass
+    read the local change as a revert by the other side.
+    """
     remote = state["git"].get("remote", "").strip()
-    if not remote:
-        return "git: no remote set"
     branch = state["git"]["branch"]
-    push = run(["git", "push", "-q", "-u", "origin", branch], cwd=GIT_DIR, check=False)
+    run(["git", "add", "-A"], cwd=GIT_DIR)
+    dirty = bool(_git(GIT_DIR, "status", "--porcelain"))
+    count = int(_git(GIT_DIR, "rev-list", "--count", "HEAD") or "0")
+    if count > 1:
+        # A history from before this design, or one someone else created. Keep
+        # the content, keep one commit: the old ones stay reachable through the
+        # snapshots that point at them, and through the reflog for a while.
+        run(["git", "checkout", "-q", "--orphan", ROLL_BRANCH], cwd=GIT_DIR)
+        run(["git", "add", "-A"], cwd=GIT_DIR)
+        run(["git", *git_identity(state), "commit", "-q", "-m", message], cwd=GIT_DIR)
+        run(["git", "branch", "-q", "-M", ROLL_BRANCH, branch], cwd=GIT_DIR)
+    elif count == 0:
+        run(["git", *git_identity(state), "commit", "-q", "--allow-empty", "-m", message],
+            cwd=GIT_DIR)
+    elif dirty:
+        run(["git", *git_identity(state), "commit", "-q", "--amend", "-m", message],
+            cwd=GIT_DIR)
+    if not remote:
+        return True, "local only: the store is the backend"
+    head = _git(GIT_DIR, "rev-parse", "HEAD")
+    tracking = _git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}")
+    if head and head == tracking:
+        return True, ""
+    push = run(["git", "push", "-q", "--force-with-lease", "-u", "origin", branch],
+               cwd=GIT_DIR, check=False)
     if push.returncode != 0:
-        return "git: push failed (the next pass retries)"
-    return "git: pushed"
+        return False, ("git: the push was refused — another machine published first, "
+                       "so the next pass reconciles against that")
+    return True, ""
+
+
+def git_tag(name: str, message: str = "", commit: str | None = None) -> None:
+    """Tag HEAD, or an explicit commit — a rename must not move the point."""
+    args = ["git", *git_identity({}), "tag", "-f", "-a", name]
+    if commit:
+        args.append(commit)
+    args += ["-m", message or name]
+    run(args, cwd=GIT_DIR)
+
+
+def valid_snapshot_name(name: str) -> str | None:
+    """Why this name cannot be a tag, or None if it can."""
+    if not name or name != name.strip():
+        return "a snapshot name cannot be empty or have surrounding spaces"
+    if len(name) > 100:
+        return "a snapshot name cannot be longer than 100 characters"
+    bad = set(" ~^:?*[\\")
+    if any(ch in bad or ord(ch) < 32 for ch in name):
+        return "a snapshot name cannot contain spaces or any of ~ ^ : ? * [ \\"
+    if name.startswith("-") or name.startswith(".") or name.endswith("."):
+        return "a snapshot name cannot start with - or . and cannot end with ."
+    if ".." in name or "@{" in name or name.endswith(".lock"):
+        return "a snapshot name cannot contain .. or @{ or end with .lock"
+    if run(["git", "check-ref-format", f"refs/tags/{name}"], cwd=GIT_DIR,
+           check=False).returncode != 0:
+        return f"{name!r} is not a valid tag name"
+    return None
+
+
+def snapshot_points(state) -> list[dict]:
+    """Every resumable point: the rolling commit first, then the tags.
+
+    Automatic tags (the ones a resume makes for itself) are marked, so the picker
+    can show what the user named and nothing else.
+    """
+    points: list[dict] = []
+    branch = state["git"]["branch"]
+    tip = (_git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}")
+           or _git(GIT_DIR, "rev-parse", "--verify", "-q", "HEAD"))
+    if tip:
+        when = _git(GIT_DIR, "log", "-1", "--format=%cI", tip)
+        points.append({"name": "latest", "label": "Latest", "when": when,
+                       "auto": False, "latest": True})
+    out = _git(GIT_DIR, "for-each-ref", "--sort=-creatordate",
+               "--format=%(refname:short)\t%(creatordate:iso-strict)", "refs/tags")
+    for line in out.splitlines():
+        if "\t" not in line:
+            continue
+        name, when = line.split("\t", 1)
+        points.append({"name": name, "label": name, "when": when,
+                       "auto": name.startswith(RESUME_TAG_PREFIX), "latest": False})
+    return points
+
+
+def snapshot_create(state, name: str, quiet: bool = False) -> str:
+    """Tag the state the store holds now, and publish the tag."""
+    problem = valid_snapshot_name(name)
+    if problem:
+        raise RuntimeError(problem)
+    if _git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/tags/{name}"):
+        raise RuntimeError(f"a snapshot called {name!r} already exists — "
+                           "rename it, or pick another name")
+    note = git_fetch_reset(state)
+    if note:
+        print(f"git: {note}")
+    published, push_note = git_roll(state, roll_message(state, subject=f"configsync snapshot {name}"))
+    if push_note:
+        print(f"git: {push_note}")
+    git_tag(name, f"configsync snapshot {name} · {time.strftime('%Y-%m-%d %H:%M')}")
+    pushed = run(["git", "push", "-q", "--force", "origin", f"refs/tags/{name}"],
+                 cwd=GIT_DIR, check=False).returncode == 0
+    if not quiet:
+        print(f"snapshot: {name} — {'published' if pushed else 'kept locally, the push failed'}")
+    return name
+
+
+def snapshot_rename(state, old: str, new: str) -> None:
+    problem = valid_snapshot_name(new)
+    if problem:
+        raise RuntimeError(problem)
+    if not _git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/tags/{old}"):
+        raise RuntimeError(f"no snapshot called {old!r}")
+    if _git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/tags/{new}"):
+        raise RuntimeError(f"a snapshot called {new!r} already exists")
+    commit = _git(GIT_DIR, "rev-list", "-n", "1", old)
+    git_tag(new, f"configsync snapshot {new} · {time.strftime('%Y-%m-%d %H:%M')}", commit)
+    run(["git", "tag", "-d", old], cwd=GIT_DIR)
+    if _git(GIT_DIR, "remote", "get-url", "origin"):
+        run(["git", "push", "-q", "--force", "origin", f"refs/tags/{new}"],
+            cwd=GIT_DIR, check=False)
+        run(["git", "push", "-q", "origin", f":refs/tags/{old}"], cwd=GIT_DIR, check=False)
+    print(f"snapshot: {old} is now {new} ({commit[:12]})")
+
+
+def snapshot_drop(state, name: str) -> None:
+    if not _git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/tags/{name}"):
+        raise RuntimeError(f"no snapshot called {name!r}")
+    run(["git", "tag", "-d", name], cwd=GIT_DIR)
+    if _git(GIT_DIR, "remote", "get-url", "origin"):
+        run(["git", "push", "-q", "origin", f":refs/tags/{name}"], cwd=GIT_DIR, check=False)
+    print(f"snapshot: dropped {name}")
+
+
+def snapshot_resolve(state, name: str) -> tuple[str, str]:
+    """The commit a resume should go back to, and the label to report."""
+    branch = state["git"]["branch"]
+    if name in ("latest", ""):
+        tip = (_git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}")
+               or _git(GIT_DIR, "rev-parse", "--verify", "-q", "HEAD"))
+        if not tip:
+            raise RuntimeError("there is nothing to go back to yet")
+        return tip, "Latest"
+    commit = _git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/tags/{name}^{{commit}}")
+    if not commit:
+        raise RuntimeError(f"no snapshot called {name!r}")
+    return commit, name
+
+
+def snapshot_resume(state, name: str, dry: bool = False) -> Report:
+    """Put this machine back to a snapshot: local only, then published.
+
+    The current state is tagged first (`pre-resume-…`), so the point being left
+    is a named, pushed point rather than a reflog entry. The store is then set to
+    the snapshot's tree and an ordinary pass runs in "the snapshot wins" mode:
+    differing local files are moved to the trash and replaced, local-only files
+    are moved to the trash, and everything the snapshot has is written back.
+    """
+    commit, label = snapshot_resolve(state, name)
+    stamp_now = stamp()
+    auto = f"{RESUME_TAG_PREFIX}{slug(name or 'latest')}-{stamp_now}"
+    report = Report()
+    if dry:
+        print(f"resume: would go back to {label} ({commit[:12]})")
+        return sync_all(state, dry=True, force="backend", only="git")
+    with OperationLock():
+        note = git_fetch_reset(state)
+        if note:
+            report.notes.append(f"git: {note}")
+        # What is being left behind, kept as a named point before anything moves.
+        git_roll(state, roll_message(state, subject=f"configsync before resume to {label}"))
+        git_tag(auto, f"configsync automatic: before resuming {label} · "
+                      f"{time.strftime('%Y-%m-%d %H:%M')}")
+        if _git(GIT_DIR, "remote", "get-url", "origin"):
+            run(["git", "push", "-q", "--force", "origin", f"refs/tags/{auto}"],
+                cwd=GIT_DIR, check=False)
+        report.notes.append(f"kept {auto} as the state before this resume")
+        run(["git", "checkout", "-q", "-B", state["git"]["branch"], commit], cwd=GIT_DIR)
+        run(["git", "clean", "-qfd"], cwd=GIT_DIR)
+        inner = sync_all(state, force="backend", only="git",
+                         message=f"configsync resume {label}")
+        report.absorb(label, PairResult())          # keep the counts below
+        report.pushed, report.pulled = inner.pushed, inner.pulled
+        report.deleted, report.kept = inner.deleted, inner.kept
+        report.conflicts, report.errors = inner.conflicts, inner.errors
+        report.notes += inner.notes
+    return report
 
 
 def app_patterns(app) -> list[str]:
@@ -1370,7 +1629,9 @@ class Report:
         return base
 
 
-def sync_all(state, selected=None, dry=False, prefer=None, only=None) -> Report:
+def sync_all(state, selected=None, dry=False, prefer=None, only=None,
+             force=None, message=None) -> Report:
+    """One pass. `force="backend"` is a resume: the store is already the truth."""
     report = Report()
     pairs = app_pairs(state, selected)
     if not dry:
@@ -1379,40 +1640,54 @@ def sync_all(state, selected=None, dry=False, prefer=None, only=None) -> Report:
         except Exception as exc:  # noqa: BLE001
             report.notes.append(f"software capture skipped: {exc}")
     has_git = any(p["app"]["target"] == "git" for p in pairs)
-    if has_git and (not only or only == "git"):
+    wants_git = has_git and (not only or only == "git")
+    if wants_git and not force:
+        # A resume has already put the store exactly where it should be, so it
+        # does not fetch over itself.
         try:
             ensure_git_repo(state)
             if not dry:
-                git_prepare(state)
+                note = git_fetch_reset(state)
+                if note:
+                    report.notes.append(f"git: {note}")
         except Exception as exc:  # noqa: BLE001
             report.errors.append(str(exc).splitlines()[0])
 
+    pending: list[tuple[str, dict, dict]] = []
     for pair in pairs:
         app = pair["app"]
         if only and app["target"] != only:
             continue
         if app["target"] == "gdrive" and not state["gdrive"].get("remote", "").strip():
             continue
-        delete = True if app["target"] == "git" else bool(state["gdrive"].get("delete", False))
+        is_git = app["target"] == "git"
+        delete = True if is_git else bool(state["gdrive"].get("delete", False))
         try:
             res = reconcile_pair(pair["key"], app["name"], pair["local"],
                                  pair["backend"],
                                  app_patterns(app), delete=delete, dry=dry,
-                                 prefer=prefer,
+                                 prefer=prefer, force=force,
                                  allow_secrets=bool(app.get("allowSecrets")),
                                  remote_slack=backend_tolerance(app),
-                                 single_name=pair["name"])
+                                 single_name=pair["name"],
+                                 defer_baseline=is_git)
             report.absorb(app["name"], res)
+            if res.pending_baseline:
+                pending.append(res.pending_baseline)
         except Exception as exc:  # noqa: BLE001 — report, never crash the shell
             report.errors.append(f"{app['name']}: {str(exc).splitlines()[0]}")
 
-    if not dry and report.ok() and has_git and (not only or only == "git"):
-        try:
-            note = git_commit_push(state)
-            if note:
-                report.notes.append(note)
-        except Exception as exc:  # noqa: BLE001
-            report.errors.append(str(exc).splitlines()[0])
+    if not dry and wants_git:
+        published, note = ((False, "") if not report.ok()
+                           else git_roll(state, message or roll_message(state, report)))
+        if note:
+            report.notes.append(f"git: {note}")
+        for key, new_local, new_remote in pending:
+            save_baseline(key, new_local, new_remote, published=published)
+        if pending and not published:
+            report.notes.append(
+                "git: not published yet — the next pass keeps both versions rather "
+                "than letting the remote overwrite local work")
     return report
 
 
@@ -1435,6 +1710,9 @@ def sync_all(state, selected=None, dry=False, prefer=None, only=None) -> Report:
 # can copy a change but it can never remove anything, on either side. Deletions
 # and everything made on the other machine wait for the three-way pass
 # (`watch --once`), which is what the systemd timer runs on its interval.
+
+ROLL_BRANCH = "configsync-roll"     # scratch branch while flattening to one commit
+RESUME_TAG_PREFIX = "pre-resume-"   # automatic tags a resume makes for itself
 
 RSW_MARKER = "rsw-watch"          # rsw's own marker: how lsw and dsw find them
 RSW_EVENTS = "modify,create,delete,move"
@@ -1949,6 +2227,8 @@ def cmd_sync(args):
             return
         record_result(state, report.ok(), report.message(), report)
         print(report.message())
+        for note in report.notes:
+            print(f"  {note}")
         sys.exit(0 if report.ok() else 1)
 
 
@@ -2015,6 +2295,72 @@ def cmd_service(args):
     return 0
 
 
+def cmd_snapshot(args):
+    """Named points: the only history a squashed branch keeps."""
+    action = args.action or "list"
+    state = load_state()
+    try:
+        if action == "create":
+            if not args.name:
+                sys.exit("snapshot create needs a name")
+            with OperationLock():
+                ensure_git_repo(state)
+                snapshot_create(state, args.name)
+            return 0
+        if action == "list":
+            points = [p for p in snapshot_points(state) if args.all or not p["auto"]]
+            if args.json:
+                print(json.dumps(points, indent=2))
+                return 0
+            if not points:
+                print("no snapshots yet — `configsync snapshot create <name>` keeps one")
+                return 0
+            for point in points:
+                if point["latest"]:
+                    print(f"latest   · {point['when']}  (the rolling commit)")
+                else:
+                    kind = "automatic" if point["auto"] else "snapshot"
+                    print(f"{point['name']:<24} · {point['when']}  ({kind})")
+            return 0
+        if action == "rename":
+            if not args.name or not args.new_name:
+                sys.exit("snapshot rename needs the old and the new name")
+            with OperationLock():
+                snapshot_rename(state, args.name, args.new_name)
+            return 0
+        if action == "drop":
+            if not args.name:
+                sys.exit("snapshot drop needs a name")
+            with OperationLock():
+                snapshot_drop(state, args.name)
+            return 0
+        if action == "resume":
+            name = args.name or "latest"
+            if args.dry_run:
+                report = snapshot_resume(state, name, dry=True)
+                print(report.message())
+                for note in report.notes:
+                    print(f"  {note}")
+                return 0
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    sys.exit("add --yes to confirm a resume: it overwrites local files "
+                             "(their current versions move to the trash)")
+                answer = input(f"Resume this machine to {name!r}? Files that differ are "
+                               "overwritten and the versions being replaced move to the "
+                               "trash. [y/N] ")
+                if answer.strip().lower() not in ("y", "yes"):
+                    sys.exit("resume: cancelled")
+            report = snapshot_resume(state, name)
+            print(report.message())
+            for note in report.notes:
+                print(f"  {note}")
+            return 0 if report.ok() else 1
+        sys.exit(f"unknown snapshot action: {action}")
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+
+
 def cmd_trash(args):
     index = TRASH_DIR / "index.json"
     entries = []
@@ -2067,7 +2413,7 @@ def cmd_download(args):
         state = load_state()
         try:
             ensure_git_repo(state)
-            git_prepare(state)
+            git_fetch_reset(state)
             record_result(state, True, "downloaded the git backend into the local store")
             print("downloaded the git backend into the local store")
         except Exception as exc:  # noqa: BLE001
@@ -2313,6 +2659,20 @@ def main(argv=None):
     p = sub.add_parser("service", help="manage the systemd user timer")
     p.add_argument("action", choices=["install", "uninstall", "status"])
     p.set_defaults(func=cmd_service)
+
+    p = sub.add_parser("snapshot",
+                       help="named points of the synced config: rename, go back to")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["create", "list", "rename", "resume", "drop"])
+    p.add_argument("name", nargs="?", help="the snapshot name (or 'latest')")
+    p.add_argument("new_name", nargs="?", help="the new name, for rename")
+    p.add_argument("--all", action="store_true",
+                   help="include the automatic pre-resume points")
+    p.add_argument("--json", action="store_true", help="for the panel")
+    p.add_argument("--dry-run", action="store_true",
+                   help="resume: say what would move, change nothing")
+    p.add_argument("--yes", action="store_true", help="resume: do not ask")
+    p.set_defaults(func=cmd_snapshot)
 
     p = sub.add_parser("trash", help="list, restore or empty what a sync removed")
     p.add_argument("action", choices=["list", "restore", "restore-all", "empty"],

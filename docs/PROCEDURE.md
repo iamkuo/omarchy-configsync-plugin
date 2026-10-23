@@ -180,13 +180,14 @@ For each pair, under one lock:
    non-blocking: a second run reports "another operation is running" instead of
    interleaving, and the timer simply skips that cycle.
 2. **Get the backend to its latest first.** For a git pair: make sure the store
-   is a repository, `git fetch`, and rebase the store onto `origin/<branch>` —
-   so the comparison is against what the remote actually holds. This is what
-   stops a fresh machine from pushing its own default configs over the real ones.
-   If that rebase conflicts, the store itself has diverged and the pass stops
-   with a clear error instead of guessing. For a Drive pair: a folder that is not
-   configured is skipped, and one that is not there is reported as an error for
-   that item.
+   is a repository, `git fetch`, and `git reset --hard origin/<branch>` — the
+   store becomes exactly what the remote holds, deletions included. There is no
+   merge and no rebase: git is transport, so the comparison is against the
+   remote's real content and nothing has to be resolved by hand. A file a
+   watcher copied into the store since the last pass survives as untracked; it
+   came from the local side, which this pass scans anyway. For a Drive pair: a
+   folder that is not configured is skipped, and one that is not there is
+   reported as an error for that item.
 3. **Scan the local side**, then **scan the backend side**, with the same filters
    — so an excluded or secret file is invisible on *both* sides rather than
    looking like a new file on one of them.
@@ -197,9 +198,11 @@ For each pair, under one lock:
    stdin NUL-separated (`--from0 --files-from=-`) so spaces and newlines in names
    cannot be mangled, and with `--ignore-times` so a copy the plan decided on is
    never silently skipped by rsync's own coarse check.
-7. **Commit and push** for git pairs: `git add -A`, commit with a message naming
-   what moved, push to the remote. A genuine git conflict on the store stops the
-   pass with an error instead of guessing.
+7. **Roll and publish** for git pairs: `git add -A`, fold the result into the
+   branch's single commit (`--amend`; a longer history is flattened to one
+   commit), and push with `--force-with-lease`. A refused lease means another
+   machine published first — nothing is lost, the next pass reconciles against
+   that content. The message names what moved and when.
 8. **Save the baseline** and the run's counts, timestamp and result into the state
    file, which is what the panel and `configsync state` report.
 

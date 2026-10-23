@@ -176,6 +176,30 @@ class ConfigSyncTest(unittest.TestCase):
             text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         return proc.stdout if proc.returncode == 0 else ""
 
+    def commit_count(self, machine: Machine, branch="main") -> int:
+        proc = subprocess.run(["git", "-C", str(machine.store(".")), "rev-list",
+                               "--count", "HEAD"], text=True, stdout=subprocess.PIPE)
+        return int(proc.stdout.strip() or "0")
+
+    def local_tip(self, machine: Machine) -> str:
+        return subprocess.run(["git", "-C", str(machine.store(".")), "rev-parse", "HEAD"],
+                              text=True, stdout=subprocess.PIPE).stdout.strip()
+
+    def tags(self, machine: Machine) -> list[str]:
+        out = subprocess.run(["git", "-C", str(machine.store(".")), "tag"],
+                             text=True, stdout=subprocess.PIPE).stdout
+        return out.split()
+
+    def tag_content(self, machine: Machine, tag: str, rel: str) -> str:
+        proc = subprocess.run(["git", "-C", str(machine.store(".")), "show",
+                               f"{tag}:home/{rel}"], text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+        return proc.stdout
+
+    def trash_rels(self, machine: Machine) -> list[str]:
+        out = machine.run("trash", "list", "--limit", "50")
+        return [line for line in out.splitlines() if '"rel"' in line]
+
     # -- tests -------------------------------------------------------------
     def test_first_sync_captures_local_state(self):
         a = self.machine("a")
@@ -447,6 +471,127 @@ class ConfigSyncTest(unittest.TestCase):
         copies = list((self.drive / "Documents").glob("notes.conflict-*"))
         self.assertEqual(len(copies), 1)
         self.assertEqual(copies[0].read_text(), "hello\n")
+
+    # -- the rolling commit and snapshots ----------------------------------
+
+    def test_the_branch_keeps_exactly_one_commit(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "one\n")
+        self.configure(a)
+        a.run("sync")
+        for text in ("two", "three", "four"):
+            a.write(GHOSTTY, f"{text}\n")
+            a.run("sync")
+        self.assertEqual(self.commit_count(a), 1,
+                         "every pass rewrites the one rolling commit")
+        self.assertEqual(self.local_tip(a), self.remote_branch(),
+                         "the remote tip is the rolling commit, force-pushed")
+        self.assertEqual(self.store_show(".config/ghostty/config"), "four\n")
+
+    def test_a_snapshot_is_a_named_tag_that_a_pass_cannot_rewrite(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "three\n")
+        self.configure(a)
+        a.run("sync")
+        a.run("snapshot", "create", "before-theme-change")
+        a.write(GHOSTTY, "four\n")
+        a.run("sync")
+        self.assertEqual(self.commit_count(a), 1)
+        self.assertEqual(self.tag_content(a, "before-theme-change", ".config/ghostty/config"),
+                         "three\n", "the tag keeps the point, not the rewritten commit")
+        listing = a.run("snapshot", "list")
+        self.assertIn("latest", listing)
+        self.assertIn("before-theme-change", listing)
+
+    def test_snapshot_names_are_validated_and_renamed_in_place(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "one\n")
+        self.configure(a)
+        a.run("sync")
+        a.run("snapshot", "create", "keep-me")
+        before = self.tag_content(a, "keep-me", ".config/ghostty/config")
+        a.run("snapshot", "rename", "keep-me", "renamed")
+        self.assertEqual(self.tags(a), ["renamed"])
+        self.assertEqual(self.tag_content(a, "renamed", ".config/ghostty/config"), before)
+        out = a.run("snapshot", "create", "bad name", check=False)
+        self.assertIn("cannot contain spaces", out)
+        out = a.run("snapshot", "create", "renamed", check=False)
+        self.assertIn("already exists", out)
+        a.run("snapshot", "drop", "renamed")
+        self.assertEqual(self.tags(a), [])
+
+    def test_resume_restores_the_snapshot_and_keeps_what_it_replaced(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "three\n")
+        self.configure(a)
+        a.run("sync")
+        a.run("snapshot", "create", "good-state")
+        a.write(GHOSTTY, "four\n")
+        a.write(".config/ghostty/extra.conf", "made later\n")
+        a.run("sync")
+        out = a.run("snapshot", "resume", "good-state", "--yes")
+        self.assertIn("pre-resume-good-state", out)
+        self.assertEqual(a.read(GHOSTTY), "three\n", "the snapshot wins")
+        self.assertFalse(a.exists(".config/ghostty/extra.conf"),
+                         "what the snapshot does not have is removed")
+        trashed = " ".join(self.trash_rels(a))
+        self.assertIn('"rel": "config"', trashed)
+        self.assertIn('"rel": "extra.conf"', trashed)
+        self.assertEqual(self.commit_count(a), 1, "still one rolling commit")
+        self.assertEqual(a.read(GHOSTTY), self.store_show(".config/ghostty/config"))
+        listing = a.run("snapshot", "list")
+        self.assertNotIn("pre-resume", listing,
+                         "the picker shows what the user named")
+        self.assertIn("pre-resume", a.run("snapshot", "list", "--all"))
+
+    def test_a_resume_is_published_to_the_other_machine(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "three\n")
+        self.configure(a)
+        a.run("sync")
+        a.run("snapshot", "create", "good-state")
+        a.write(GHOSTTY, "four\n")
+        a.run("sync")
+        a.run("snapshot", "resume", "good-state", "--yes")
+        b = self.machine("b")
+        self.configure(b)
+        b.run("sync")
+        self.assertEqual(b.read(GHOSTTY), "three\n")
+
+    def test_an_unpublished_pass_does_not_lose_local_edits(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "one\n")
+        a.run("scan")
+        a.run("set-backend", "git", "remote", str(self.root / "not-there.git"))
+        a.run("set-backend", "gdrive", "remote", str(self.drive))
+        a.run("sync")
+        a.write(GHOSTTY, "two\n")
+        out = a.run("sync")
+        self.assertEqual(a.read(GHOSTTY), "two\n",
+                         "a push that never landed must not clobber the local edit")
+        self.assertIn("not published", out)
+        a.run("sync")
+        self.assertEqual(a.read(GHOSTTY), "two\n", "and it stays put on the next pass")
+
+    def test_a_two_sided_edit_is_a_conflict_copy_not_a_stopped_pass(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "font-size = 14\n")
+        self.configure(a)
+        a.run("sync")
+        b = self.machine("b")
+        self.configure(b)
+        b.run("sync")
+        a.write(GHOSTTY, "font-size = 16\n")
+        a.run("sync")
+        b.write(GHOSTTY, "font-size = 9\n")
+        out = b.run("sync", check=False)
+        self.assertNotIn("conflict with the remote", out,
+                         "git no longer stops the pass: the reconciler decides")
+        self.assertEqual(b.read(GHOSTTY), "font-size = 9\n")
+        copies = list((b.home / ".local/share/omarchy-configsync").rglob("config.conflict-*"))
+        self.assertTrue(copies, "the version that lost is kept beside it")
+        self.assertEqual(copies[0].read_text(), "font-size = 16\n")
+        self.assertEqual(self.commit_count(b), 1)
 
     def test_state_migrates_the_old_auto_switch(self):
         a = self.machine("a")

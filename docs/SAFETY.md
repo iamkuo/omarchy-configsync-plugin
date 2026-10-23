@@ -96,11 +96,13 @@ The one action a user would press does not restore anything, and the message
 asks them to resolve a git conflict by hand inside an internal working tree.
 The restore only worked if they knew to run `download` and then `deploy`.
 
-**Now:** the backend is fetched and rebased *first*, then every file is compared
-three ways. On a machine with no baseline the backend wins (it is the setup being
-restored) and each differing local file is preserved under
+**Now:** the backend is fetched and *reset* — no merge, no rebase — and then
+every file is compared three ways. On a machine with no baseline the backend wins
+(it is the setup being restored) and each differing local file is preserved under
 `~/.local/share/omarchy-configsync/conflicts/first-sync-<date>/`. One `Sync now`
 restores a fresh machine; `--prefer local` inverts the direction deliberately.
+The store is a checkout of the remote, so there is no state in it that a pass
+could conflict with, and no git error the user has to resolve by hand.
 
 ### 2.4 The software manifest was trusted input — High
 

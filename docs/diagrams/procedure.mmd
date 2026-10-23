@@ -34,13 +34,13 @@ flowchart TD
 
   subgraph S4["5. The three-way pass, one pair at a time"]
     N["Take the run lock"]
-    O["Get the backend to its latest:<br/>git fetch and rebase the store<br/>Drive folder configured?"]
+    O["Get the backend to its latest:<br/>git fetch, reset the store to origin<br/>(no merge) · Drive folder configured?"]
     P["Scan the local side, filtered"]
     Q["Scan the backend side, same filters"]
     R["Load the baseline recorded last pass"]
     S["make_plan: local vs backend vs baseline"]
     T["Apply: rsync copies, conflict copies,<br/>removals moved to the trash"]
-    U["git pairs: add, commit, push"]
+    U["git pairs: fold into the one<br/>rolling commit, push --force-with-lease"]
     V["Save the new baseline, counts, last run"]
     N --> O --> P --> Q --> R --> S --> T --> U --> V
   end

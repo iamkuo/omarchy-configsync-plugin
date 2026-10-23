@@ -116,9 +116,9 @@ other side changed.
 **The full pass is `configsync watch --once`**, run by a systemd user timer
 (`configsync-watch.timer`: 45s after login, every `pull` minutes — 10 by
 default — and once more a minute after you switch watching on). That pass is
-what pulls changes made on other machines (inotify cannot see those), commits
-and pushes what the watchers copied into the git store, and propagates
-deletions. With no systemd user session, `Service.qml` runs the same command on
+what pulls changes made on other machines (inotify cannot see those), folds
+what the watchers copied into the store into the single rolling commit, pushes
+it, and propagates deletions. With no systemd user session, `Service.qml` runs the same command on
 a Qt timer instead, and starts the watchers when the shell comes up.
 
 ```bash
@@ -164,6 +164,37 @@ every local file that differed is kept under
 `~/.local/share/omarchy-configsync/conflicts/first-sync-<date>/`. Run it with
 `--dry-run` first, or `--prefer local` to push instead of pull.
 
+## Snapshots
+
+The branch keeps one commit, so the only history worth keeping is what you name
+yourself. A snapshot is a tag: an immutable point the squash can never rewrite,
+pushed to the remote so any machine can see it.
+
+```bash
+configsync snapshot create before-theme-change   # name it what you like
+configsync snapshot list                         # latest + your snapshots, timestamped
+configsync snapshot rename before-theme-change old-theme
+configsync snapshot resume old-theme             # back to that point, this machine
+configsync snapshot resume old-theme --dry-run   # say what would move first
+configsync snapshot drop old-theme
+```
+
+`snapshot list` shows exactly two kinds of entry: **latest** (the rolling commit,
+with its timestamp) and the snapshots you named. A resume tags the state it is
+leaving as `pre-resume-<name>-<timestamp>` before it moves anything, so the point
+you were on is a named, pushed point rather than a reflog entry — `snapshot list
+--all` shows those automatic tags too.
+
+A resume is a local operation with a fleet-wide effect, and it says so: the
+snapshot's content is written over this machine's files, anything the snapshot
+does not have is removed, and every local file that is replaced or removed is
+moved to the trash first, so a resume you regret is still a resume you can undo
+with `configsync trash restore`. The restored state is then published like any
+other change, so your other machines pick it up on their next pass — keeping
+their own unsynced edits as conflict copies, exactly as they would for any
+two-sided change. Drive items are not part of a resume: a Drive folder has no
+history to go back to, so only git items move.
+
 ## Requirements and limits
 
 - **Backends are not authenticated by this plugin.** The Drive backend assumes
@@ -175,10 +206,16 @@ every local file that differed is kept under
   on one machine, with its timestamps faked back, is invisible to any tool that
   does not read every file on every pass. `configsync sync --dry-run` reports
   what would move.
-- **The git backend is not a merge tool.** A two-sided edit is kept (see the
-  table) and the loser is committed beside the winner, so the repository is
-  linear. A genuine git conflict on the *store* itself (a machine pushing
-  history that diverged) stops the pass with an error instead of guessing.
+- **Git is transport, not the decision maker.** The store is a checkout of the
+  remote; every pass fetches, sets the store to what the remote holds, lets the
+  reconciler decide every file, then rewrites the branch's single commit and
+  pushes it with `--force-with-lease`. Nothing is ever merged by git, so a
+  two-sided edit behaves the same here as it does on a Drive folder: both
+  versions are kept, and the pass never stops with a git conflict.
+- **The branch holds one commit, always.** `git log` is a single line, and the
+  snapshot tags are the only points that are never rewritten. Anything you
+  cloned or committed to that remote by hand is overwritten by the next pass —
+  this remote is the plugin's, not a general-purpose one.
 - **The Drive backend tolerates timestamp rounding** (2 seconds), because FUSE
   and network mounts round them. A same-size edit is then noticed as soon as the
   stamp drifts past that window, not lost.

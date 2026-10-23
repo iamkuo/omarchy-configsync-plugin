@@ -34,6 +34,14 @@ Panel {
   property var stateData: ({ apps: [], git: {}, gdrive: {}, watch: {}, lastSync: {}, software: {} })
   property var reposData: []
   property var softwarePlan: null
+  // Snapshots: the rolling commit first, then the tags the user named. The
+  // panel never invents a point of its own — it lists what the CLI reports.
+  property var snapshots: []
+  property bool snapshotsBusy: false
+  property string snapshotDraft: ""
+  property string snapshotRenameFrom: ""
+  property string resumeTarget: ""
+  property bool resumeArmed: false
   property bool reposBusy: false
   property bool loaded: false
   property bool busy: false
@@ -234,6 +242,46 @@ Panel {
     root.run(["watch", root.watchOn ? "--off" : "--on"])
   }
 
+  function loadSnapshots() {
+    if (snapshotsProc.running) return
+    root.snapshotsBusy = true
+    snapshotsProc.command = ["python3", root.scriptPath, "snapshot", "list", "--json"]
+    snapshotsProc.running = true
+  }
+  function openSnapshots() {
+    root.resumeArmed = false
+    root.loadSnapshots()
+    snapshotsPopup.open()
+  }
+  function askSnapshotName(from) {
+    root.snapshotRenameFrom = from || ""
+    root.snapshotDraft = from || ("snapshot-" + Qt.formatDateTime(new Date(), "yyyyMMdd-HHmm"))
+    namePopup.open()
+    namePopup.contentItem.forceActiveFocus()
+  }
+  function submitSnapshotName() {
+    var name = String(root.snapshotDraft || "").trim()
+    if (!name) return
+    var from = root.snapshotRenameFrom
+    root.snapshotRenameFrom = ""
+    namePopup.close()
+    snapshotsPopup.close()
+    root.run(from ? ["snapshot", "rename", from, name] : ["snapshot", "create", name])
+  }
+  // A resume overwrites local files, so it takes two clicks: the first arms it
+  // and says what will happen, the second does it.
+  function armResume(name) {
+    if (root.resumeArmed && root.resumeTarget === name) {
+      root.resumeArmed = false
+      root.resumeTarget = ""
+      snapshotsPopup.close()
+      root.run(["snapshot", "resume", name, "--yes"])
+      return
+    }
+    root.resumeTarget = name
+    root.resumeArmed = true
+    resumeTimer.restart()
+  }
   function rearmWatchers() {
     root.run(["watch", "--ensure"])
   }
@@ -312,6 +360,28 @@ Panel {
         }
       }
     }
+  }
+
+  Process {
+    id: snapshotsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var points = JSON.parse(text)
+          if (points && points.length !== undefined) root.snapshots = points
+        } catch (e) {
+          // Leave the last list on screen.
+        }
+      }
+    }
+    onRunningChanged: if (!running) root.snapshotsBusy = false
+  }
+
+  Timer {
+    id: resumeTimer
+    interval: 6000
+    onTriggered: { root.resumeArmed = false; root.resumeTarget = "" }
   }
 
   Timer {
@@ -464,6 +534,36 @@ Panel {
               accent: Color.accent
               fontFamily: root.contentFontFamily
               onClicked: { overflowMenu.close(); root.requestSoftwarePlan() }
+            }
+
+            Button {
+              text: "Snapshot now…"
+              tooltipText: "Keep this exact state as a named point you can go back to"
+              enabled: !root.busy
+              leftAlign: true
+              Layout.fillWidth: true
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(5)
+              foreground: root.contentForeground
+              accent: Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: { overflowMenu.close(); root.askSnapshotName("") }
+            }
+
+            Button {
+              text: "Snapshots…"
+              tooltipText: "The latest state and your named points: rename, or go back to one"
+              enabled: !root.busy
+              leftAlign: true
+              Layout.fillWidth: true
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(5)
+              foreground: root.contentForeground
+              accent: Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: { overflowMenu.close(); root.openSnapshots() }
             }
 
             Button {
@@ -792,6 +892,206 @@ Panel {
   }
 
   // ---- software plan confirmation ----------------------------------------
+  Popup {
+    id: snapshotsPopup
+    parent: overflowButton
+    x: Math.max(0, overflowButton.width - width)
+    y: overflowButton.height + Style.space(4)
+    padding: Style.space(8)
+    modal: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    background: BorderSurface {
+      color: Color.popups.background
+      borderSpec: Border.localOrSurfaceSpec("popups", "border", Color.popups.border, Color.popups.border, Math.max(1, Style.space(2)))
+      radius: Style.cornerRadius
+    }
+    contentItem: ColumnLayout {
+      spacing: Style.space(6)
+      implicitWidth: Style.space(360)
+
+      RowLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(6)
+
+        Label {
+          text: "Snapshots"
+          color: root.contentForeground
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+          Layout.fillWidth: true
+        }
+
+        Button {
+          text: "New…"
+          tooltipText: "Keep the state this machine holds now, under a name you choose"
+          bordered: true
+          foreground: root.contentForeground
+          accent: Color.accent
+          fontFamily: root.contentFontFamily
+          fontSize: Style.font.caption
+          horizontalPadding: Style.space(6)
+          verticalPadding: Style.space(3)
+          onClicked: { snapshotsPopup.close(); root.askSnapshotName("") }
+        }
+      }
+
+      Label {
+        text: root.snapshotsBusy
+              ? "reading…"
+              : (root.snapshots.length
+                 ? "Going back writes the chosen point over this machine's files. What is replaced moves to the trash, and the other machines follow on their next sync."
+                 : "No snapshots yet — “New…” keeps this state under a name.")
+        textFormat: Text.PlainText
+        color: Qt.darker(root.contentForeground, 1.3)
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        Layout.fillWidth: true
+        Layout.maximumWidth: Style.space(330)
+      }
+
+      Repeater {
+        model: root.snapshots
+
+        delegate: RowLayout {
+          required property var modelData
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+
+          ColumnLayout {
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            spacing: 0
+
+            Label {
+              text: modelData.label
+              textFormat: Text.PlainText
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: !!modelData.latest
+              elide: Label.ElideRight
+              Layout.fillWidth: true
+            }
+
+            Label {
+              text: (modelData.latest ? "the rolling commit · " : "")
+                    + String(modelData.when).replace("T", " ").slice(0, 16)
+              textFormat: Text.PlainText
+              color: Qt.darker(root.contentForeground, 1.5)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              elide: Label.ElideRight
+              Layout.fillWidth: true
+            }
+          }
+
+          Button {
+            visible: !modelData.latest
+            text: "Rename"
+            tooltipText: "Give this snapshot another name"
+            bordered: true
+            foreground: root.contentForeground
+            accent: Color.accent
+            fontFamily: root.contentFontFamily
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(6)
+            verticalPadding: Style.space(3)
+            onClicked: { snapshotsPopup.close(); root.askSnapshotName(modelData.name) }
+          }
+
+          Button {
+            text: (root.resumeArmed && root.resumeTarget === modelData.name) ? "Sure?" : "Go back"
+            tooltipText: "Write this point over this machine's files"
+            bordered: true
+            foreground: (root.resumeArmed && root.resumeTarget === modelData.name) ? Color.urgent : root.contentForeground
+            accent: (root.resumeArmed && root.resumeTarget === modelData.name) ? Color.urgent : Color.accent
+            fontFamily: root.contentFontFamily
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(6)
+            verticalPadding: Style.space(3)
+            onClicked: root.armResume(modelData.name)
+          }
+        }
+      }
+    }
+  }
+
+  Popup {
+    id: namePopup
+    parent: overflowButton
+    x: Math.max(0, overflowButton.width - width)
+    y: overflowButton.height + Style.space(4)
+    padding: Style.space(8)
+    modal: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    background: BorderSurface {
+      color: Color.popups.background
+      borderSpec: Border.localOrSurfaceSpec("popups", "border", Color.popups.border, Color.popups.border, Math.max(1, Style.space(2)))
+      radius: Style.cornerRadius
+    }
+    contentItem: ColumnLayout {
+      spacing: Style.space(6)
+      implicitWidth: Style.space(320)
+
+      Label {
+        text: root.snapshotRenameFrom ? "Rename snapshot" : "Name this snapshot"
+        color: root.contentForeground
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+      }
+
+      TextField {
+        Layout.fillWidth: true
+        text: root.snapshotDraft
+        placeholderText: "before-theme-change"
+        foreground: root.contentForeground
+        verticalPadding: Style.space(4)
+        onTextEdited: root.snapshotDraft = text
+        onAccepted: root.submitSnapshotName()
+      }
+
+      Label {
+        text: "This becomes the git tag, so letters, digits, . - and _ only, with no spaces."
+        textFormat: Text.PlainText
+        color: Qt.darker(root.contentForeground, 1.3)
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        Layout.fillWidth: true
+        Layout.maximumWidth: Style.space(300)
+      }
+
+      RowLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(6)
+
+        Button {
+          text: "Cancel"
+          bordered: true
+          foreground: root.contentForeground
+          accent: Color.accent
+          fontFamily: root.contentFontFamily
+          fontSize: Style.font.caption
+          onClicked: namePopup.close()
+        }
+
+        Button {
+          text: root.snapshotRenameFrom ? "Rename" : "Keep"
+          bordered: true
+          foreground: root.contentForeground
+          accent: Color.accent
+          fontFamily: root.contentFontFamily
+          fontSize: Style.font.caption
+          Layout.fillWidth: true
+          onClicked: root.submitSnapshotName()
+        }
+      }
+    }
+  }
+
   Popup {
     id: softwarePopup
     parent: overflowButton
