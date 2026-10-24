@@ -40,18 +40,18 @@ Then set the two backends once (`configsync set-backend ...`, below) and press
 `Super+Space` → search "Config Sync", or click the sync icon on the bar.
 
 ```
-┌ ⣿  CONFIG SYNC           ⟳ Sync now  ⋯ ┐
-│   47 items · 35 syncing               │
-│ Git github.com:you/dotfiles · Drive … │
-│ ( Items · 47 ) ( Repos · 12 )         │
-│ ⬒ Alacritty  ~/.config/alacritty      │
-│      [Git][Drive]  ✕          [ on ]  │
-│ ⚠ Chromium  Browser profile           │
-│                        ✕     [ off ]  │
-│ …                                     │
-│ 4 sent · 1 received · 2 conflict c…   │
-│ Watch for changes              [ on ] │
-└───────────────────────────────────────┘
+┌ ⣿  CONFIG SYNC                 Sync now ⋯ ┐
+│   47 items · 35 syncing                   │
+│ ( Items · 47 ) ( Repos · 12 )             │
+│ ⬒ Alacritty  ~/.config/alacritty          │
+│      [Git][Drive]  ✕          [ on ]      │
+│ ⚠ Chromium  Browser profile               │
+│                        ✕     [ off ]      │
+│ …                                         │
+│ [git up to date] [☁ Drive synced]          │
+│ [👁 Watch 12/12] [📦 13 plugins · 183 pkgs] │
+│ Last pass 12:04 · 3 sent · 1 received      │
+└───────────────────────────────────────────┘
 ```
 
 Everything that can sync is one list, enabled items first. Each row has a tile,
@@ -67,10 +67,31 @@ The `✕` removes a row: a folder you added is deleted outright, and a detected
 app is remembered as hidden so the next scan does not put it straight back
 (**Reset plugin** in the `⋯` menu brings everything back).
 
-The `⋯` menu holds the rare actions: **Rescan apps**, **Reinstall software**
-(shows the plan before anything is installed) and **Reset plugin** (press twice).
-The backend fields collapse to one dim line once both are set, and expand when
-you press **Backends**.
+The `⋯` menu holds the rare actions: **Rescan apps**, **Backends…**,
+**Reinstall software** (shows the plan before anything is installed) and
+**Reset plugin** (press twice).
+
+### Status chips
+
+The footer is a row of status chips — one per area — that say what is happening
+right now and open a details popover with the actions for that area. They are
+deliberately short; the popover has the numbers.
+
+| Chip | States | Click opens |
+|------|--------|-------------|
+| **Git** | `not set` · `idle` · `up to date` · `↑2 to send` · `↓1 to bring` · `push refused` · `syncing…` | Last-pass counts, branch, ahead/behind, remote; **Sync now**, **Download**, **Deploy**, **Edit backend** |
+| **Drive** | `not set` · `not mounted` · `idle` · `synced` · `syncing…` | Folder, availability, last-pass counts; **Sync now**, **Download**, **Deploy**, **Edit backend** |
+| **Watch** | `off` · `n of m` · `n path(s)` · `starting…` | Whether watching is on, paths watched, timer interval; **Start/Stop watching**, **Re-arm** |
+| **Software** | `not recorded` · `13 plugins · 183 pkgs` | Manifest date; **Show plan & reinstall** |
+| **Trash** | `3 in trash` (only when non-empty) | **Restore latest**, **Restore all** |
+
+The line under the chips is the last pass (`12:04 · 3 sent · 1 received`),
+also clickable for the full result and any notes. Green means in step, amber
+means something needs attention (push refused, Drive missing, a path no longer
+watched), and dim means switched off or not configured.
+
+The backend fields are no longer a permanent row: open them with
+**⋯ → Backends…** or **Edit backend** in the Git/Drive popover.
 
 ### What is not in the GUI
 
