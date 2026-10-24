@@ -213,10 +213,34 @@ Panel {
     }
   }
 
+  // Two kinds of thing to sync, kept apart: the app configs the scanner found,
+  // and the folders or files the user picked themselves.
+  readonly property var itemEntries: {
+    var out = []
+    for (var i = 0; i < root.apps.length; i++) {
+      var k = root.apps[i].kind
+      if (k === "config" || k === "dotfile" || k === "omarchy") out.push(root.apps[i])
+    }
+    return out
+  }
+  readonly property var folderEntries: {
+    var out = []
+    for (var i = 0; i < root.apps.length; i++) {
+      var k = root.apps[i].kind
+      if (k === "personal" || k === "custom") out.push(root.apps[i])
+    }
+    return out
+  }
+
   // Enabled items float to the top, then alphabetical — so what is syncing is
   // always the first thing in view.
   readonly property var shown: {
-    var out = root.apps.slice()
+    var out = root.sortEntries(root.tab === "folders" ? root.folderEntries
+                                                      : root.itemEntries)
+    return out
+  }
+  function sortEntries(items) {
+    var out = items.slice()
     out.sort(function(a, b) {
       var ae = a.enabled ? 0 : 1
       var be = b.enabled ? 0 : 1
@@ -229,7 +253,8 @@ Panel {
   }
 
   readonly property var tabOptions: [
-    { value: "items", label: "Items · " + root.apps.length },
+    { value: "items", label: "Apps · " + root.itemEntries.length },
+    { value: "folders", label: "Folders · " + root.folderEntries.length },
     { value: "repos", label: "Repos · " + root.reposData.length }
   ]
   readonly property int enabledCount: {
@@ -238,7 +263,8 @@ Panel {
     return n
   }
   readonly property string headerSummary: root.loaded
-    ? (apps.length + " items · " + enabledCount + " syncing")
+    ? (root.itemEntries.length + " app configs · " + root.folderEntries.length
+       + " folders · " + enabledCount + " syncing")
     : "scanning…"
 
   function shorten(text) {
@@ -290,7 +316,7 @@ Panel {
   }
 
   function cycleTab(direction) {
-    var order = ["items", "repos"]
+    var order = ["items", "folders", "repos"]
     var i = order.indexOf(root.tab)
     var next = order[(i + (direction < 0 ? order.length - 1 : 1)) % order.length]
     root.setTab(next)
@@ -914,7 +940,7 @@ Panel {
       RowLayout {
         Layout.fillWidth: true
         spacing: Style.space(8)
-        visible: root.tab !== "repos"
+        visible: root.tab === "folders"
 
         TextField {
           id: addField
@@ -966,6 +992,17 @@ Panel {
 
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) { root.handleListKeys(list, event) }
+        }
+
+        Label {
+          anchors.centerIn: parent
+          visible: root.tab === "folders" && root.folderEntries.length === 0
+          text: "No folders of your own yet.\nAdd one above to sync it with Drive."
+          horizontalAlignment: Text.AlignHCenter
+          textFormat: Text.PlainText
+          color: Qt.darker(root.contentForeground, 1.6)
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.bodySmall
         }
 
         ListView {
