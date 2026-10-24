@@ -264,6 +264,7 @@ Panel {
 
   function requestSoftwarePlan() {
     if (planProc.running) return
+    root.softwarePlan = null
     planProc.command = ["python3", root.scriptPath, "install-software", "--plan"]
     planProc.running = true
   }
@@ -483,7 +484,13 @@ Panel {
             softwarePopup.open()
           }
         } catch (e) {
-          root.softwarePlan = null
+          // The CLI merges stderr into stdout, so the error text is right here.
+          // Show it rather than leaving the button looking dead.
+          root.softwarePlan = {
+            ready: false,
+            reason: String(text).trim() || "the CLI returned no plan"
+          }
+          softwarePopup.open()
         }
       }
     }
@@ -1476,7 +1483,11 @@ Panel {
         wrapMode: Text.WordWrap
         text: {
           var p = root.softwarePlan || ({})
-          if (!p.ready) return "No software manifest yet — run Sync on a machine that already has your setup."
+          if (!p.ready) {
+            return p.reason
+              ? ("Could not read the plan: " + p.reason)
+              : "No software manifest yet — run Sync on a machine that already has your setup."
+          }
           return "From the manifest captured on " + String(p.host || "another machine") + " on "
             + String(p.capturedAt || "?") + ". Only what is missing gets installed."
         }

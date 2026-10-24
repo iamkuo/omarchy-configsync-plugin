@@ -207,6 +207,11 @@ EXCLUDES = [
     "Visited Links", "TransportSecurity", "Network Persistent State",
     "*.lock", "*.log", "*.tmp", "*.tmp.*", "logs", ".git", "node_modules",
     "__pycache__", "*.pyc",
+    # Machine-local state and tool caches: never config, sometimes enormous,
+    # and the backend store itself lives under .local.
+    ".cache", ".local", ".cargo", ".rustup", ".npm", ".nvm", ".pyenv",
+    ".conda", ".m2", ".gradle", ".venv", ".Trash", ".steam", ".var",
+    ".vscode-server", ".ollama",
 ]
 
 # Key, token and vault files that are never copied, anywhere, even out of a
@@ -1829,7 +1834,13 @@ def watch_targets(state) -> dict[str, tuple[str, list[str]]]:
     """
     targets: dict[str, tuple[str, list[str]]] = {}
     for pair in app_pairs(state):
-        local_base, backend_base, _is_dir = pair_bases(pair["local"], pair["backend"])
+        local_base, backend_base, is_dir = pair_bases(pair["local"], pair["backend"])
+        if not is_dir:
+            # A single file's "base" is its parent directory. Watching that for
+            # ~/.bashrc would watch all of $HOME and, because the backend store
+            # lives under $HOME, copy the store into itself. Files change rarely;
+            # the periodic pass handles them.
+            continue
         filters = app_patterns(pair["app"])
         if not pair["app"].get("allowSecrets"):
             filters = filters + list(SECRET_FILES)
@@ -1845,6 +1856,17 @@ def is_ours(watcher: dict, sources: dict[str, str]) -> bool:
 
 def start_rsw(source: Path, destination: Path, filters=()) -> str:
     """Start one watcher. Returns "" on success, or why it did not start."""
+    # A copy whose destination is inside its source would recurse: the watcher
+    # would rsync the store into itself, once per change, until the disk fills.
+    # Never start one; the periodic pass is what should handle such a pair.
+    try:
+        src = Path(source).resolve()
+        dst = Path(destination).resolve()
+    except OSError:
+        src, dst = Path(source), Path(destination)
+    if src == dst or dst.is_relative_to(src) or src.is_relative_to(dst):
+        return (f"refusing to watch {to_tilde(src)}: its backend "
+                f"{to_tilde(dst)} overlaps it")
     for binary, package in (("inotifywait", "inotify-tools"), ("rsync", "rsync")):
         if not have(binary):
             return f"{binary} is not installed (sudo pacman -S {package})"
@@ -1946,7 +1968,7 @@ def watch_view(state) -> dict:
         "watchers": watchers,
         "watching": sum(1 for w in watchers if w["mine"]),
         "others": sum(1 for w in watchers if not w["mine"]),
-        "expected": len(managed_sources(state)),
+        "expected": len(watch_targets(state)),
         "lastPass": state["watch"].get("lastPass", ""),
         "lastResult": state["watch"].get("lastResult", ""),
         "systemd": bool(state["watch"].get("systemd")),
@@ -2555,16 +2577,15 @@ def cmd_capture_software(args):
 
 
 def cmd_install_software(args):
+    # Reading the plan is not a mutation: it must answer even while a pass holds
+    # the operation lock, or the panel's "Show plan" is a no-op whenever it
+    # matters (during a pass, which is exactly when the user is looking).
+    if args.plan or (not args.yes and not sys.stdin.isatty()):
+        print(json.dumps(software_plan(), indent=2))
+        return 0
     with OperationLock():
         state = load_state()
         try:
-            if args.plan:
-                print(json.dumps(software_plan(), indent=2))
-                return 0
-            if not args.yes and not sys.stdin.isatty():
-                # Called from the shell without confirmation: show the plan.
-                print(json.dumps(software_plan(), indent=2))
-                return 0
             message = install_software(dry=args.dry_run)
             record_result(state, True, message)
             print(message)

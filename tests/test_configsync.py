@@ -10,6 +10,7 @@ subprocess. Run with:
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import shutil
 import subprocess
@@ -699,6 +700,42 @@ class ConfigSyncTest(unittest.TestCase):
         self.assertIn("watch: off", out)
         self.assertFalse(a.state()["watch"]["enabled"])
         self.assertEqual(a.state()["watch"]["watching"], 0)
+
+    def test_a_single_file_item_never_watches_home(self):
+        # A dotfile's "base" is its parent, which for ~/.bashrc is all of $HOME.
+        # Watching that, with the store under ~/.local, rsyncs the store into
+        # itself until the disk is full.
+        a = self.machine("a")
+        a.write(".bashrc", "export X=1\n")
+        self.configure(a)
+        out = a.run("watch", "--on")
+        view = a.state()["watch"]
+        sources = [w["source"] for w in view["watchers"]]
+        self.assertNotIn("~", sources, out)
+        self.assertNotIn(str(a.home), sources, out)
+        self.assertTrue(view["expected"] >= 1,
+                        "directory items still get watched")
+        self.assertEqual(view["watching"], view["expected"])
+
+    def test_install_software_plan_answers_while_an_operation_holds_the_lock(self):
+        a = self.machine("a")
+        a.write(".config/omarchy/configsync/software.json", json.dumps({
+            "capturedAt": "2026-01-01 00:00", "host": "other",
+            "plugins": [],
+            "packages": {"native": ["firefox"], "aur": []},
+        }))
+        lock = a.home / ".local/share/omarchy-configsync/lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            raw = a.run("install-software", "--plan", check=False)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        plan = json.loads(raw)
+        self.assertTrue(plan["ready"], raw)
+        self.assertIn("firefox", [p["name"] for p in plan["packages"]])
 
     def test_service_install_without_systemd_reports_the_fallback(self):
         a = self.machine("a")
