@@ -103,6 +103,21 @@ class Machine:
         (self.home / "Documents").mkdir(parents=True, exist_ok=True)
         self.env = {**os.environ, "HOME": str(self.home), "USER": "tester"}
         self.env.pop("XDG_RUNTIME_DIR", None)   # keep the systemd path honest
+        # Hermetic tools: the tests must not depend on what this machine happens
+        # to have installed. pacman reports nothing installed, omarchy no
+        # plugins, and systemctl succeeds (only the watch tests turn systemd on).
+        shim = root / "shim-bin"
+        shim.mkdir(exist_ok=True)
+        for tool, body in (
+            ("pacman", "#!/bin/sh\nexit 0\n"),
+            ("omarchy", '#!/bin/sh\n[ "$1 $2" = "plugin list" ] && echo "[]"\nexit 0\n'),
+            ("systemctl", "#!/bin/sh\nexit 0\n"),
+        ):
+            path = shim / tool
+            if not path.exists():
+                path.write_text(body)
+                path.chmod(0o755)
+        self.env["PATH"] = str(shim) + os.pathsep + self.env.get("PATH", "")
 
     def write(self, rel: str, text: str) -> Path:
         path = self.home / rel
@@ -250,6 +265,25 @@ class ConfigSyncTest(unittest.TestCase):
 
         a.run("sync")
         self.assertEqual(a.read(GHOSTTY), "two\n")
+
+    def test_last_sync_reports_each_backend_separately(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "one\n")
+        a.write("Documents/notes.txt", "hello\n")
+        self.configure(a)
+        a.run("sync")
+
+        state = a.state()
+        git = state["lastSync"].get("git") or {}
+        drive = state["lastSync"].get("drive") or {}
+        self.assertTrue(git.get("at"), "git gets its own last-pass stamp")
+        self.assertTrue(drive.get("at"), "Drive gets its own last-pass stamp")
+        self.assertGreaterEqual(git.get("pushed", 0), 1)
+        self.assertGreaterEqual(drive.get("pushed", 0), 1)
+        self.assertIn("published", git, "the push outcome is recorded for git")
+        self.assertIsInstance(state["git"]["ahead"], int)
+        self.assertIsInstance(state["git"]["behind"], int)
+        self.assertTrue(state["git"]["lastLog"], "the last commit time is exposed")
 
     def test_both_sides_edit_keeps_both_versions(self):
         a = self.machine("a")
@@ -558,6 +592,44 @@ class ConfigSyncTest(unittest.TestCase):
         b.run("sync")
         self.assertEqual(b.read(GHOSTTY), "three\n")
 
+    def test_a_snapshot_from_another_machine_is_fetched(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "three\n")
+        self.configure(a)
+        a.run("sync")
+        a.run("snapshot", "create", "before-theme-change")
+        # The branch moves on, so the tag's commit is no longer its ancestor:
+        # only an explicit tags fetch can bring it to the other machine.
+        a.write(GHOSTTY, "four\n")
+        a.run("sync")
+
+        b = self.machine("b")
+        self.configure(b)
+        b.run("sync")
+        self.assertIn("before-theme-change", self.tags(b),
+                      "a pass fetches tags, not only the branch")
+        self.assertEqual(
+            self.tag_content(b, "before-theme-change", ".config/ghostty/config"),
+            "three\n")
+
+    def test_resume_dry_run_plans_against_the_snapshot(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "three\n")
+        self.configure(a)
+        a.run("sync")
+        a.run("snapshot", "create", "good-state")
+        a.write(GHOSTTY, "four\n")
+        a.write(".config/ghostty/extra.conf", "made later\n")
+        a.run("sync")
+
+        out = a.run("snapshot", "resume", "good-state", "--dry-run")
+        self.assertIn("would restore config", out,
+                      "the snapshot's version is what would win")
+        self.assertIn("would delete extra.conf", out,
+                      "a file the snapshot does not have would be removed")
+        self.assertEqual(a.read(GHOSTTY), "four\n", "a dry-run changes nothing")
+        self.assertTrue(a.exists(".config/ghostty/extra.conf"))
+
     def test_an_unpublished_pass_does_not_lose_local_edits(self):
         a = self.machine("a")
         a.write(GHOSTTY, "one\n")
@@ -633,6 +705,18 @@ class ConfigSyncTest(unittest.TestCase):
         out = a.run("service", "install", check=False)
         self.assertIn("no systemd user session", out)
         self.assertEqual(json.loads(a.run("service", "status"))["installed"], False)
+
+    def test_watch_on_records_whether_systemd_owns_the_timer(self):
+        a = self.machine("a")
+        a.run("scan")
+        a.env["XDG_RUNTIME_DIR"] = str(self.root / "run")
+        (self.root / "run").mkdir(exist_ok=True)
+        a.run("watch", "--on")
+        self.assertTrue(a.state()["watch"].get("systemd"),
+                        "the shell service must know systemd owns the pass")
+        a.run("watch", "--off")
+        self.assertFalse(a.state()["watch"].get("systemd"),
+                         "and know when it no longer does")
 
     def test_watcher_pushes_local_edits(self):
         # Same contract as rsw: one rsync at startup, then one per change.

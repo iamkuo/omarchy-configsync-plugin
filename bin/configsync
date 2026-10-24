@@ -50,6 +50,9 @@ import re
 import shlex
 import shutil
 import hashlib
+import io
+import tarfile
+import tempfile
 import socket
 import subprocess
 import sys
@@ -1316,7 +1319,7 @@ def git_fetch_reset(state) -> str:
     branch = state["git"]["branch"]
     if not _git(GIT_DIR, "remote", "get-url", "origin"):
         return "no remote"
-    reached = run(["git", "fetch", "-q", "origin", branch], cwd=GIT_DIR,
+    reached = run(["git", "fetch", "-q", "--tags", "origin", branch], cwd=GIT_DIR,
                   check=False).returncode == 0
     note = "" if reached else "could not reach the remote — using the last known state"
     if not _git(GIT_DIR, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}"):
@@ -1502,6 +1505,34 @@ def snapshot_resolve(state, name: str) -> tuple[str, str]:
     return commit, name
 
 
+def _snapshot_tree(commit: str) -> Path:
+    """Extract a snapshot's tree into a temp dir, for an honest dry-run plan.
+
+    A resume dry-run must compare against the snapshot it would check out, not
+    against whatever the store happens to hold now. Extracting to a scratch
+    directory gives that without touching the store or the index.
+    """
+    # The store's own root is the repo; the tree that mirrors $HOME is its
+    # `home/` subtree, so archive that and the relative paths line up.
+    data = None
+    for source in (f"{commit}:home", commit):
+        proc = subprocess.run(["git", "archive", source], cwd=GIT_DIR,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              check=False)
+        if proc.returncode == 0:
+            data = proc.stdout
+            break
+    if data is None:
+        raise RuntimeError("could not read the snapshot's tree")
+    tree = Path(tempfile.mkdtemp(prefix="configsync-snapshot-"))
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+        try:
+            archive.extractall(tree, filter="data")
+        except TypeError:  # Python < 3.12 has no extraction filter
+            archive.extractall(tree)
+    return tree
+
+
 def snapshot_resume(state, name: str, dry: bool = False) -> Report:
     """Put this machine back to a snapshot: local only, then published.
 
@@ -1517,7 +1548,12 @@ def snapshot_resume(state, name: str, dry: bool = False) -> Report:
     report = Report()
     if dry:
         print(f"resume: would go back to {label} ({commit[:12]})")
-        return sync_all(state, dry=True, force="backend", only="git")
+        tree = _snapshot_tree(commit)
+        try:
+            return sync_all(state, dry=True, force="backend", only="git",
+                            git_root=tree)
+        finally:
+            shutil.rmtree(tree, ignore_errors=True)
     with OperationLock():
         note = git_fetch_reset(state)
         if note:
@@ -1546,12 +1582,17 @@ def app_patterns(app) -> list[str]:
     return list(EXCLUDES) + list(app.get("exclude", []) or [])
 
 
-def app_pairs(state, selected=None, include_disabled=False) -> list[dict]:
+def app_pairs(state, selected=None, include_disabled=False,
+              git_root: Path | None = None) -> list[dict]:
     """One entry per enabled path: where it lives locally and in the backend.
 
     include_disabled adds the switched-off items, which the watcher needs: a
     watcher left over from an item that was just switched off is stale, and it
     can only be recognised as ours by its path.
+
+    git_root points the git pairs at a different tree than the live store. A
+    resume dry-run uses it to plan against the snapshot it would check out,
+    without touching the real store.
     """
     pairs: list[dict] = []
     drive_raw = state["gdrive"].get("remote", "").strip()
@@ -1573,7 +1614,7 @@ def app_pairs(state, selected=None, include_disabled=False) -> list[dict]:
                     continue
                 backend = expand(drive_raw) / rel
             else:
-                backend = STORE / rel
+                backend = (git_root or STORE) / rel
             pairs.append({
                 "key": f"{app['target']}:{cid}:{rel}",
                 "cid": cid,
@@ -1595,6 +1636,10 @@ class Report:
         self.conflicts: list[str] = []
         self.notes: list[str] = []
         self.errors: list[str] = []
+        # Per-backend breakdown, so the panel can show Git and Drive apart.
+        self.git = None       # a Report for target == "git"
+        self.drive = None     # a Report for target == "gdrive"
+        self.published = None  # did the git push land? None when no git pairs
 
     def absorb(self, label: str, res: PairResult) -> None:
         self.pushed += res.pushed
@@ -1630,10 +1675,12 @@ class Report:
 
 
 def sync_all(state, selected=None, dry=False, prefer=None, only=None,
-             force=None, message=None) -> Report:
+             force=None, message=None, git_root: Path | None = None) -> Report:
     """One pass. `force="backend"` is a resume: the store is already the truth."""
     report = Report()
-    pairs = app_pairs(state, selected)
+    report.git = Report()
+    report.drive = Report()
+    pairs = app_pairs(state, selected, git_root=git_root)
     if not dry:
         try:
             capture_software()
@@ -1672,14 +1719,18 @@ def sync_all(state, selected=None, dry=False, prefer=None, only=None,
                                  single_name=pair["name"],
                                  defer_baseline=is_git)
             report.absorb(app["name"], res)
+            (report.git if is_git else report.drive).absorb(app["name"], res)
             if res.pending_baseline:
                 pending.append(res.pending_baseline)
         except Exception as exc:  # noqa: BLE001 — report, never crash the shell
-            report.errors.append(f"{app['name']}: {str(exc).splitlines()[0]}")
+            line = f"{app['name']}: {str(exc).splitlines()[0]}"
+            report.errors.append(line)
+            (report.git if is_git else report.drive).errors.append(line)
 
     if not dry and wants_git:
         published, note = ((False, "") if not report.ok()
                            else git_roll(state, message or roll_message(state, report)))
+        report.published = published
         if note:
             report.notes.append(f"git: {note}")
         for key, new_local, new_remote in pending:
@@ -1898,7 +1949,8 @@ def watch_view(state) -> dict:
         "expected": len(managed_sources(state)),
         "lastPass": state["watch"].get("lastPass", ""),
         "lastResult": state["watch"].get("lastResult", ""),
-        "systemd": systemd_available(),
+        "systemd": bool(state["watch"].get("systemd")),
+        "systemdAvailable": systemd_available(),
         "service": service_status(),
         "mode": "rsw" if watchers else "",
     }
@@ -1976,6 +2028,21 @@ def service_status() -> dict:
             "active": active, "enabled": enabled, "path": to_tilde(timer)}
 
 
+def _set_watch_systemd(value: bool) -> None:
+    """Record whether systemd owns the periodic pass.
+
+    The shell service reads this from the state file; without it written, the
+    service cannot tell that a systemd timer exists and runs a second schedule
+    of its own. Re-read before writing so a concurrent toggle is not clobbered.
+    """
+    fresh = load_state()
+    watch = fresh.setdefault("watch", {})
+    if bool(watch.get("systemd")) == bool(value):
+        return
+    watch["systemd"] = bool(value)
+    save_state(fresh)
+
+
 def service_install(pull_minutes=None, verbose=True) -> tuple[bool, str]:
     """Write and start the user timer. Returns (installed, message)."""
     if not systemd_available():
@@ -1995,6 +2062,7 @@ def service_install(pull_minutes=None, verbose=True) -> tuple[bool, str]:
                check=False, timeout=30)
     if proc.returncode != 0:
         return False, f"systemctl --user enable failed: {proc.stdout.strip()}"
+    _set_watch_systemd(True)
     if verbose:
         print(f"passes: systemd user timer {to_tilde(UNIT_DIR / TIMER_NAME)} "
               f"every {minutes} min")
@@ -2009,6 +2077,8 @@ def service_enable(enabled: bool, verbose=False) -> tuple[bool, str]:
         return service_install(verbose=verbose)
     proc = run(["systemctl", "--user", "disable", "--now", TIMER_NAME],
                check=False, timeout=30)
+    if proc.returncode == 0:
+        _set_watch_systemd(False)
     if verbose:
         print("passes: timer disabled")
     return proc.returncode == 0, "systemd"
@@ -2026,6 +2096,7 @@ def service_uninstall(verbose=True) -> None:
             removed = True
     if removed and have("systemctl") and systemd_available():
         run(["systemctl", "--user", "daemon-reload"], check=False, timeout=30)
+    _set_watch_systemd(False)
     if verbose:
         print("passes: systemd units removed")
 
@@ -2070,6 +2141,20 @@ def record_result(state, ok, message, report: Report | None = None,
             "conflictPaths": report.conflicts[:5],
             "notes": report.notes[-5:],
         })
+        for name, sub in (("git", report.git), ("drive", report.drive)):
+            if sub is None:
+                continue
+            entry = {
+                "at": fresh["lastSync"]["at"],
+                "ok": not sub.errors,
+                "pushed": sub.pushed,
+                "pulled": sub.pulled,
+                "deleted": sub.deleted,
+                "conflicts": len(sub.conflicts),
+            }
+            if name == "git" and report.published is not None:
+                entry["published"] = bool(report.published)
+            fresh["lastSync"][name] = entry
     if watch_pass:
         fresh["watch"]["lastPass"] = fresh["lastSync"]["at"]
         fresh["watch"]["lastResult"] = message
@@ -2084,6 +2169,27 @@ def cmd_scan(args):
         print(f"detected {len(state['apps'])} apps ({added} new/changed)")
 
 
+def git_divergence(state) -> tuple[int, int, str]:
+    """(ahead, behind, last commit time) of the store vs its last fetch.
+
+    This is deliberately fetch-free: the panel reads `state` often, and a status
+    read must never wait on the network. It reflects the last time a pass
+    fetched, which is exactly what the next pass will reconcile against.
+    """
+    branch = state["git"]["branch"]
+    if not (GIT_DIR / ".git").exists():
+        return 0, 0, ""
+    if not _git(GIT_DIR, "rev-parse", "--verify", "-q",
+                f"refs/remotes/origin/{branch}"):
+        return 0, 0, _git(GIT_DIR, "log", "-1", "--format=%cI", "HEAD")
+    counts = _git(GIT_DIR, "rev-list", "--left-right", "--count",
+                  f"origin/{branch}...HEAD").split()
+    behind = ahead = 0
+    if len(counts) == 2:
+        behind, ahead = int(counts[0]), int(counts[1])
+    return ahead, behind, _git(GIT_DIR, "log", "-1", "--format=%cI", "HEAD")
+
+
 def cmd_state(args):
     state = load_state()
     apps = [dict(id=cid, **app) for cid, app in state["apps"].items()]
@@ -2095,6 +2201,7 @@ def cmd_state(args):
             trash_count = len(json.loads((TRASH_DIR / "index.json").read_text()))
         except (OSError, json.JSONDecodeError):
             trash_count = 0
+    git_ahead, git_behind, git_last = git_divergence(state)
     out = {
         "version": state["version"],
         # For the panel: it shortens paths against this instead of guessing.
@@ -2103,6 +2210,9 @@ def cmd_state(args):
             "remote": state["git"].get("remote", ""),
             "branch": state["git"].get("branch", "main"),
             "configured": bool(state["git"].get("remote", "").strip()),
+            "ahead": git_ahead,
+            "behind": git_behind,
+            "lastLog": git_last,
         },
         "gdrive": {
             "remote": state["gdrive"].get("remote", ""),
