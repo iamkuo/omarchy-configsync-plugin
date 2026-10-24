@@ -628,8 +628,7 @@ Panel {
           contentItem: Column {
             id: menuColumn
             spacing: Style.space(1)
-            implicitWidth: Style.space(232)
-            implicitHeight: childrenRect.height
+            width: Style.space(232)
 
             Button {
               width: menuColumn.width
