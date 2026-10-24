@@ -614,8 +614,8 @@ Panel {
           id: overflowMenu
           parent: overflowButton
           x: overflowButton.width - width
-          y: overflowButton.height + Style.space(4)
-          padding: Style.space(4)
+          y: overflowButton.height + Style.space(6)
+          padding: Style.space(6)
           modal: false
           closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
@@ -625,19 +625,22 @@ Panel {
             radius: Style.cornerRadius
           }
 
-          contentItem: ColumnLayout {
-            spacing: Style.space(2)
-            implicitWidth: Style.space(230)
+          contentItem: Column {
+            id: menuColumn
+            spacing: Style.space(1)
+            implicitWidth: Style.space(232)
+            implicitHeight: childrenRect.height
 
             Button {
+              width: menuColumn.width
+              height: Style.space(30)
               text: "Rescan apps"
               tooltipText: "Look for config folders and dotfiles again"
               enabled: !root.busy
               leftAlign: true
-              Layout.fillWidth: true
               fontSize: Style.font.bodySmall
               horizontalPadding: Style.space(8)
-              verticalPadding: Style.space(5)
+              verticalPadding: 0
               foreground: root.contentForeground
               accent: Color.accent
               fontFamily: root.contentFontFamily
@@ -645,21 +648,30 @@ Panel {
             }
 
             Button {
+              width: menuColumn.width
+              height: Style.space(30)
               text: "Backends…"
               tooltipText: "Where synced items are stored: a git repo and a Drive folder"
               enabled: !root.busy
               leftAlign: true
-              Layout.fillWidth: true
               fontSize: Style.font.bodySmall
               horizontalPadding: Style.space(8)
-              verticalPadding: Style.space(5)
+              verticalPadding: 0
               foreground: root.contentForeground
               accent: Color.accent
               fontFamily: root.contentFontFamily
               onClicked: { overflowMenu.close(); root.backendsOpen = true }
             }
 
+            Rectangle {
+              width: menuColumn.width
+              height: 1
+              color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.12)
+            }
+
             Button {
+              width: menuColumn.width
+              height: Style.space(30)
               text: "Reinstall software"
               tooltipText: {
                 var s = root.stateData.software || {}
@@ -668,10 +680,9 @@ Panel {
               }
               enabled: !root.busy && !!(root.stateData.software && root.stateData.software.captured)
               leftAlign: true
-              Layout.fillWidth: true
               fontSize: Style.font.bodySmall
               horizontalPadding: Style.space(8)
-              verticalPadding: Style.space(5)
+              verticalPadding: 0
               foreground: root.contentForeground
               accent: Color.accent
               fontFamily: root.contentFontFamily
@@ -679,14 +690,15 @@ Panel {
             }
 
             Button {
+              width: menuColumn.width
+              height: Style.space(30)
               text: "Snapshot now…"
               tooltipText: "Keep this exact state as a named point you can go back to"
               enabled: !root.busy
               leftAlign: true
-              Layout.fillWidth: true
               fontSize: Style.font.bodySmall
               horizontalPadding: Style.space(8)
-              verticalPadding: Style.space(5)
+              verticalPadding: 0
               foreground: root.contentForeground
               accent: Color.accent
               fontFamily: root.contentFontFamily
@@ -694,29 +706,37 @@ Panel {
             }
 
             Button {
+              width: menuColumn.width
+              height: Style.space(30)
               text: "Snapshots…"
               tooltipText: "The latest state and your named points: rename, or go back to one"
               enabled: !root.busy
               leftAlign: true
-              Layout.fillWidth: true
               fontSize: Style.font.bodySmall
               horizontalPadding: Style.space(8)
-              verticalPadding: Style.space(5)
+              verticalPadding: 0
               foreground: root.contentForeground
               accent: Color.accent
               fontFamily: root.contentFontFamily
               onClicked: { overflowMenu.close(); root.openSnapshots() }
             }
 
+            Rectangle {
+              width: menuColumn.width
+              height: 1
+              color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.12)
+            }
+
             Button {
+              width: menuColumn.width
+              height: Style.space(30)
               text: "Re-arm watchers"
               tooltipText: "Start any rsw watcher that is missing, stop stale ones"
               enabled: !root.busy && root.watchOn
               leftAlign: true
-              Layout.fillWidth: true
               fontSize: Style.font.bodySmall
               horizontalPadding: Style.space(8)
-              verticalPadding: Style.space(5)
+              verticalPadding: 0
               foreground: root.contentForeground
               accent: Color.accent
               fontFamily: root.contentFontFamily
@@ -724,19 +744,20 @@ Panel {
             }
 
             Rectangle {
-              Layout.fillWidth: true
-              Layout.preferredHeight: 1
+              width: menuColumn.width
+              height: 1
               color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.12)
             }
 
             Button {
+              width: menuColumn.width
+              height: Style.space(30)
               text: root.resetArmed ? "Sure? Reset plugin" : "Reset plugin"
               tooltipText: "Reset toggles and settings to defaults"
               leftAlign: true
-              Layout.fillWidth: true
               fontSize: Style.font.bodySmall
               horizontalPadding: Style.space(8)
-              verticalPadding: Style.space(5)
+              verticalPadding: 0
               foreground: root.resetArmed ? Color.urgent : root.contentForeground
               accent: root.resetArmed ? Color.urgent : Color.accent
               fontFamily: root.contentFontFamily
