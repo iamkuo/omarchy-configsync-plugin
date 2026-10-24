@@ -361,6 +361,11 @@ Panel {
   }
 
   function openStatus(kind) {
+    // The same chip twice closes what the first click opened.
+    if (statusPopup.opened && root.statusDetail === kind) {
+      root.closeStatus()
+      return
+    }
     root.statusDetail = kind
     statusPopup.open()
   }
