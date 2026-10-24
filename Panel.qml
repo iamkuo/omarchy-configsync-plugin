@@ -34,6 +34,10 @@ Panel {
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property string scriptPath: Qt.resolvedUrl("bin/configsync").toString().replace("file://", "")
+  // Popups size themselves to their content, and one long unbroken label was
+  // enough to make them wider than the card. Cap them at the card's inner
+  // width so labels wrap instead of running off the right edge.
+  readonly property real popupMaxWidth: contentColumn ? contentColumn.width : Style.space(488)
 
   property var stateData: ({ apps: [], git: {}, gdrive: {}, watch: {}, lastSync: {}, software: {} })
   property var reposData: []
@@ -580,6 +584,7 @@ Panel {
     root.refreshRepos()
   }
 
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -591,6 +596,7 @@ Panel {
     contentHeight: panel.fittedContentHeight(Style.space(640))
 
     ColumnLayout {
+      id: contentColumn
       anchors.fill: parent
       spacing: Style.space(10)
 
@@ -1331,7 +1337,11 @@ Panel {
   Popup {
     id: snapshotsPopup
     parent: overflowButton
-    x: Math.max(0, overflowButton.width - width)
+    width: Math.min(Style.space(360) + padding * 2, root.popupMaxWidth)
+    // Right-align with the ⋯ button, but never let the popup leave the
+    // card: if it is wider than the space to the button's left, align its
+    // left edge with the panel content instead.
+    x: Math.max(-overflowButton.x, overflowButton.width - width)
     y: overflowButton.height + Style.space(4)
     padding: Style.space(8)
     modal: true
@@ -1457,7 +1467,11 @@ Panel {
   Popup {
     id: namePopup
     parent: overflowButton
-    x: Math.max(0, overflowButton.width - width)
+    width: Math.min(Style.space(320) + padding * 2, root.popupMaxWidth)
+    // Right-align with the ⋯ button, but never let the popup leave the
+    // card: if it is wider than the space to the button's left, align its
+    // left edge with the panel content instead.
+    x: Math.max(-overflowButton.x, overflowButton.width - width)
     y: overflowButton.height + Style.space(4)
     padding: Style.space(8)
     modal: true
@@ -1531,7 +1545,11 @@ Panel {
   Popup {
     id: softwarePopup
     parent: overflowButton
-    x: Math.max(0, overflowButton.width - width)
+    width: Math.min(Style.space(340) + padding * 2, root.popupMaxWidth)
+    // Right-align with the ⋯ button, but never let the popup leave the
+    // card: if it is wider than the space to the button's left, align its
+    // left edge with the panel content instead.
+    x: Math.max(-overflowButton.x, overflowButton.width - width)
     y: overflowButton.height + Style.space(4)
     padding: Style.space(8)
     modal: true
