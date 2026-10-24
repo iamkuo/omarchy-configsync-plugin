@@ -947,7 +947,7 @@ Panel {
 
           Cells.StatusChip {
             id: gitChip
-            icon: "\uf1d3"
+            icon: "\uf126"
             label: root.gitChipLabel
             tone: root.gitChipTone
             tooltipText: "Git — " + root.gitChipLabel + ". Click for details and actions."
