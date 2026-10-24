@@ -34,6 +34,12 @@ Panel {
   property var stateData: ({ apps: [], git: {}, gdrive: {}, watch: {}, lastSync: {}, software: {} })
   property var reposData: []
   property var softwarePlan: null
+  // Pressing a chip while its popup is open closes the popup (CloseOnPressOutside)
+  // before the click arrives; remember which one just closed so that click does
+  // not immediately reopen it.
+  property string statusLastClosed: ""
+  property double statusLastClosedAt: 0
+  property double overflowLastClosedAt: 0
   // Snapshots: the rolling commit first, then the tags the user named. The
   // panel never invents a point of its own — it lists what the CLI reports.
   property var snapshots: []
@@ -366,6 +372,11 @@ Panel {
       root.closeStatus()
       return
     }
+    if (root.statusLastClosed === kind
+        && (Date.now() - root.statusLastClosedAt) < 300) {
+      root.statusLastClosed = ""
+      return
+    }
     root.statusDetail = kind
     statusPopup.open()
   }
@@ -619,7 +630,18 @@ Panel {
           horizontalPadding: Style.space(8)
           verticalPadding: Style.space(4)
           Layout.alignment: Qt.AlignVCenter
-          onClicked: overflowMenu.opened ? overflowMenu.close() : overflowMenu.open()
+          onClicked: {
+            // Pressing the button closes the menu (CloseOnPressOutside) before
+            // this click runs, so `opened` is already false here; recollect the
+            // press as a toggle instead of reopening.
+            if (overflowMenu.opened) {
+              overflowMenu.close()
+            } else if (Date.now() - root.overflowLastClosedAt < 300) {
+              root.overflowLastClosedAt = 0
+            } else {
+              overflowMenu.open()
+            }
+          }
         }
 
         Popup {
@@ -630,6 +652,7 @@ Panel {
           padding: Style.space(6)
           modal: false
           closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+          onClosed: root.overflowLastClosedAt = Date.now()
 
           background: BorderSurface {
             color: Color.popups.background
@@ -1067,7 +1090,11 @@ Panel {
           padding: Style.space(10)
           modal: false
           closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-          onClosed: root.statusDetail = ""
+          onClosed: {
+            root.statusLastClosed = root.statusDetail
+            root.statusLastClosedAt = Date.now()
+            root.statusDetail = ""
+          }
 
           background: BorderSurface {
             color: Color.popups.background
