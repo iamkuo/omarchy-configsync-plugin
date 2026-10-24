@@ -38,7 +38,12 @@ BorderSurface {
 
   RowLayout {
     id: row
-    anchors.centerIn: parent
+    // Fill the pill rather than forcing it to the label's width: when several
+    // chips share a narrow footer the labels elide instead of pushing the row
+    // past the panel's right edge.
+    anchors.fill: parent
+    anchors.leftMargin: Style.space(9)
+    anchors.rightMargin: Style.space(9)
     spacing: Style.space(5)
 
     Text {
@@ -53,6 +58,8 @@ BorderSurface {
       text: chip.label
       textFormat: Text.PlainText
       elide: Text.ElideRight
+      Layout.fillWidth: true
+      Layout.minimumWidth: 0
       color: chip.tone === "off" ? Qt.darker(chip.foreground, 1.6) : chip.foreground
       font.family: chip.fontFamily
       font.pixelSize: Style.font.caption

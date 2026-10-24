@@ -21,7 +21,11 @@ import "panel" as Cells
 Panel {
   id: root
   moduleName: "io.github.ryankuo.configsync"
-  manageIpc: false
+  // `omarchy-shell configsync-panel open|close|toggle` — also how a test opens
+  // the panel without a pointer. The service owns "configsync" for sync
+  // triggers, so the panel needs its own target.
+  manageIpc: true
+  ipcTarget: "configsync-panel"
 
   property var anchorItem: null
   property var hostWidget: null
@@ -116,7 +120,7 @@ Panel {
     if (root.watchBusy) return "Watch starting…"
     if (root.watchExpected && root.watchRunning < root.watchExpected)
       return "Watch " + root.watchRunning + "/" + root.watchExpected
-    return "Watch " + root.watchRunning + " path(s)"
+    return "Watch " + root.watchRunning
   }
   readonly property string watchChipTone: {
     if (!root.watchOn) return "off"
@@ -127,7 +131,7 @@ Panel {
   readonly property string softwareChipLabel: {
     var s = root.softwareInfo
     if (!s.captured) return "Software not recorded"
-    return s.plugins + " plugins · " + s.packages + " pkgs"
+    return s.plugins + " plugins"
   }
   readonly property string softwareChipTone: root.softwareInfo.captured ? "ok" : "off"
   readonly property string trashChipLabel: root.trashCount + " in trash"
@@ -1035,10 +1039,12 @@ Panel {
 
         RowLayout {
           Layout.fillWidth: true
+          Layout.minimumWidth: 0
           spacing: Style.space(6)
 
           Cells.StatusChip {
             id: gitChip
+            Layout.minimumWidth: 0
             icon: "\uf126"
             label: root.gitChipLabel
             tone: root.gitChipTone
@@ -1051,6 +1057,7 @@ Panel {
 
           Cells.StatusChip {
             id: driveChip
+            Layout.minimumWidth: 0
             icon: "\uf0c2"
             label: root.driveChipLabel
             tone: root.driveChipTone
@@ -1063,6 +1070,7 @@ Panel {
 
           Cells.StatusChip {
             id: watchChip
+            Layout.minimumWidth: 0
             icon: "\uf06e"
             label: root.watchChipLabel
             tone: root.watchChipTone
@@ -1075,6 +1083,7 @@ Panel {
 
           Cells.StatusChip {
             id: softwareChip
+            Layout.minimumWidth: 0
             icon: "󰏗"
             label: root.softwareChipLabel
             tone: root.softwareChipTone
@@ -1087,6 +1096,7 @@ Panel {
 
           Cells.StatusChip {
             id: trashChip
+            Layout.minimumWidth: 0
             visible: root.trashCount > 0
             icon: "\uf1f8"
             label: root.trashChipLabel
