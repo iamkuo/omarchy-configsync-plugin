@@ -10,7 +10,10 @@ Both backends run the same reconciler: a three-way comparison between the local
 tree, the backend's copy, and a baseline recorded after the last successful
 pass. A file that changed on one side is copied to the other. A file that
 changed on both sides is never silently overwritten — the version that loses is
-written next to the winner as `<name>.conflict-<host>-<date>`. A deletion only
+written next to the winner as `<name>.conflict-<host>-<date>`. That copy is a
+recovery artefact of this machine: it is never published, so one conflict cannot
+become a new file (and a new conflict) on the other machine. `configsync
+conflicts` lists them and prunes the old ones into the trash. A deletion only
 propagates when the other side is unchanged, and deleted files are moved to a
 trash folder instead of being unlinked (`configsync trash` restores them).
 
@@ -32,7 +35,9 @@ Everything else this tool writes lives beside it:
 
   baseline/    last-synced fingerprints, one file per app
   trash/       files a sync removed, restorable with `configsync trash`
-  conflicts/   first-sync copies of files that lost to the backend
+  conflicts/   first-sync batches: local copies of files that lost to a backend
+               on a first sync. A normal pass keeps its conflict copies beside
+               the file that won; `configsync conflicts prune` retires old ones
   watch.json   live watcher status, read by the panel
 
 Only config-shaped files are ever considered. Credentials, keys, sessions and
@@ -213,6 +218,25 @@ EXCLUDES = [
     ".conda", ".m2", ".gradle", ".venv", ".Trash", ".steam", ".var",
     ".vscode-server", ".ollama",
 ]
+
+# Patterns no pair may ever copy, whatever its state says. `configsync.json` is
+# this tool's own machine-local state (remotes, toggles, last result) and the
+# `.bak` `save_state` keeps beside it: two machines rewriting them every pass was
+# an endless supply of "conflicts". A `*.conflict-*` file is a local recovery
+# copy, not data to publish — publishing it turned every conflict into a new file
+# on the other machine, and could conflict again there.
+ALWAYS_EXCLUDED = ["configsync.json", "configsync.json.*", "*.conflict-*"]
+
+# State the app itself generates between passes. These differ on both sides
+# without anyone editing anything, so syncing them only yields a conflict copy
+# per pass. Anchored ("/x") patterns are relative to the app's own path.
+VOLATILE = {
+    "ibus": ["/bus"],
+    "fcitx": ["/dbus"],
+    "fcitx5": ["/conf/cached_layouts", "/conf/cached_layouts.*"],
+    "Pinta": ["/addins"],
+    "herdr": ["/session.json", "/session-snapshots", "/release-notes.json"],
+}
 
 # Key, token and vault files that are never copied, anywhere, even out of a
 # folder you added yourself: the cost of skipping one is small, the cost of
@@ -766,6 +790,28 @@ def conflict_name(name: str) -> str:
     return f"{p.stem}.conflict-{hostname()}-{stamp()}{p.suffix}"
 
 
+def conflict_copies_of(directory: Path, name: str) -> list[Path]:
+    """Every conflict copy kept beside `directory/name`."""
+    p = Path(name)
+    return sorted(directory.glob(f"{p.stem}.conflict-*{p.suffix}"))
+
+
+def existing_conflict_copy(src: Path, directory: Path, name: str) -> Path | None:
+    """A copy beside the winner that already holds exactly these bytes.
+
+    The same version can lose more than once — a daemon that rewrites its file
+    the same way on every start, a pass repeated after a failed push — and a fresh
+    copy per pass is just noise. Identical content means no second copy is needed.
+    """
+    if not src.is_file():
+        return None
+    needle = digest(src)
+    for candidate in conflict_copies_of(directory, name):
+        if candidate.is_file() and digest(candidate) == needle:
+            return candidate
+    return None
+
+
 def save_conflict_copy(src: Path, dest: Path) -> Path:
     """Keep the version that is about to lose, next to the winner."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -924,10 +970,11 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
         return result
 
     # 1. Conflicts first, so both the winner and the loser are known before
-    #    anything is copied. The local copy wins in place; the backend's
-    #    version is kept beside it (or collected under the data directory on a
-    #    first sync, where dozens of default configs can disagree at once).
-    conflict_copies: list[str] = []
+    #    anything is copied. The local copy wins in place; the backend's version
+    #    is kept beside it (or collected under the data directory on a first
+    #    sync, where dozens of default configs can disagree at once). The copy is
+    #    never pushed: it is this machine's recovery artefact, and publishing it
+    #    made every conflict a new file — and a new conflict — elsewhere.
     for rel in plan.conflicts:
         if first_sync:
             # The backend wins here (this machine is being restored), so the
@@ -935,20 +982,22 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
             src = local_base / rel
             dest = CONFLICTS_DIR / f"first-sync-{stamp()}" / rel
         else:
-            # The local copy wins in place; keep the backend's version beside it
-            # so the other machine sees what it lost.
+            # The local copy wins in place; keep the backend's version beside it.
             src = remote_base / rel
-            dest = local_base / Path(rel).parent / conflict_name(Path(rel).name)
-        if not src.exists():
+            directory = local_base / Path(rel).parent
+            dest = existing_conflict_copy(src, directory, Path(rel).name)
+            if dest is None:
+                dest = directory / conflict_name(Path(rel).name)
+        if not src.exists() or dest.exists():
             continue
         try:
             save_conflict_copy(src, dest)
-            if not first_sync:
-                conflict_copies.append(str(dest.relative_to(local_base)))
         except OSError as exc:
             result.errors.append(f"{label}: could not save {rel}: {exc}")
 
     # 2. Copies. Directories travel as their own entries; rsync creates them.
+    #    A conflicted file still pushes the winner, so the other side stops
+    #    offering the version it just lost.
     push_rels = list(plan.push)
     if not first_sync:
         push_rels += [rel for rel in plan.conflicts if (local_base / rel).exists()]
@@ -959,9 +1008,9 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
         if target.exists():
             trash(target, rel, "local", key)
     pull_rels = list(plan.pull) + list(plan.overwrite_local)
-    rsync_copy(local_base, remote_base, push_rels + conflict_copies)
+    rsync_copy(local_base, remote_base, push_rels)
     rsync_copy(remote_base, local_base, pull_rels)
-    result.pushed += len(push_rels) + len(conflict_copies)
+    result.pushed += len(push_rels)
     result.pulled += len(pull_rels)
     result.conflicts = list(plan.conflicts)
 
@@ -992,10 +1041,6 @@ def reconcile_pair(key: str, label: str, local: Path, remote: Path,
         for rel in list(plan.pull) + list(plan.overwrite_local):
             fp = remote_scan.get(rel) or fingerprint(remote_base / rel)
             new_local[rel] = new_remote[rel] = fp
-        for rel in conflict_copies:
-            fp = fingerprint(local_base / rel)
-            if fp is not None:
-                new_local[rel] = new_remote[rel] = fp
         for rel in plan.delete_remote + plan.delete_local:
             new_local.pop(rel, None)
             new_remote.pop(rel, None)
@@ -1089,9 +1134,23 @@ def capture_software() -> dict:
         "plugins": plugins,
         "packages": {"native": _pacman("-Qqen"), "aur": _pacman("-Qqem")},
     }
+    # The manifest is synced data. Writing it on every pass — its `capturedAt`
+    # always differs — made it a local edit every ten minutes, and a conflict on
+    # every pass once the other machine had captured its own. Keep the old file
+    # (and its timestamp) unless something that travels actually changed.
+    previous = load_manifest()
+    if previous is not None and _same_manifest(previous, manifest):
+        return previous
     MANIFEST.parent.mkdir(parents=True, exist_ok=True)
     MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
+
+
+def _same_manifest(previous: dict, current: dict) -> bool:
+    """Is this the same manifest, apart from when and where it was captured?"""
+    ignore = ("capturedAt", "host")
+    return ({k: v for k, v in previous.items() if k not in ignore}
+            == {k: v for k, v in current.items() if k not in ignore})
 
 
 def load_manifest():
@@ -1583,8 +1642,11 @@ def snapshot_resume(state, name: str, dry: bool = False) -> Report:
     return report
 
 
-def app_patterns(app) -> list[str]:
-    return list(EXCLUDES) + list(app.get("exclude", []) or [])
+def app_patterns(app, cid: str | None = None) -> list[str]:
+    """The rsync/scan filters for one app: always-on, generated, then its own."""
+    patterns = (list(EXCLUDES) + list(ALWAYS_EXCLUDED)
+                + list(VOLATILE.get(cid or "", [])))
+    return patterns + list(app.get("exclude", []) or [])
 
 
 def app_pairs(state, selected=None, include_disabled=False,
@@ -1717,7 +1779,7 @@ def sync_all(state, selected=None, dry=False, prefer=None, only=None,
         try:
             res = reconcile_pair(pair["key"], app["name"], pair["local"],
                                  pair["backend"],
-                                 app_patterns(app), delete=delete, dry=dry,
+                                 app_patterns(app, pair["cid"]), delete=delete, dry=dry,
                                  prefer=prefer, force=force,
                                  allow_secrets=bool(app.get("allowSecrets")),
                                  remote_slack=backend_tolerance(app),
@@ -1841,7 +1903,15 @@ def watch_targets(state) -> dict[str, tuple[str, list[str]]]:
             # lives under $HOME, copy the store into itself. Files change rarely;
             # the periodic pass handles them.
             continue
-        filters = app_patterns(pair["app"])
+        if pair["app"]["target"] == "git":
+            # A fast copy into the git store cannot reach the other machine
+            # before a pass commits and pushes it, so it buys no latency — and it
+            # leaves the store's working tree holding local content, which the
+            # next pass reads as a change made on the other machine. That is what
+            # used to manufacture a conflict copy on every pass for any file its
+            # owner rewrites.
+            continue
+        filters = app_patterns(pair["app"], pair["cid"])
         if not pair["app"].get("allowSecrets"):
             filters = filters + list(SECRET_FILES)
         targets[str(local_base)] = (str(backend_base), filters)
@@ -2539,6 +2609,126 @@ def cmd_trash(args):
     return 0
 
 
+def cmd_conflicts(args):
+    """List the local conflict copies, or retire the old ones.
+
+    A conflict copy is kept beside the file that won, is never synced, and is
+    never needed by the other machine. Nothing deletes them on its own — a run
+    that keeps losing the same file (a daemon that rewrites it, a push that keeps
+    being refused) would otherwise leave one per pass forever, so `prune` keeps
+    the newest few and moves the rest to the trash.
+    """
+    state = load_state()
+    action = args.action or "list"
+    copies = local_conflict_copies(state)
+    if action == "list":
+        rows = [{"path": to_tilde(p), "size": p.stat().st_size,
+                 "at": time.strftime("%Y-%m-%d %H:%M",
+                                     time.localtime(p.stat().st_mtime)),
+                 "original": to_tilde(original_of(p))}
+                for p in copies]
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    keep = 0 if action == "empty" else max(0, args.keep)
+    with OperationLock():
+        try:
+            ensure_git_repo(state)
+            git_fetch_reset(state)
+        except Exception as exc:  # noqa: BLE001
+            print(f"conflicts: git: {str(exc).splitlines()[0]}", file=sys.stderr)
+        retired = prune_conflict_copies(copies, keep)
+        retired += prune_first_sync_dirs(keep)
+        in_store = store_conflict_copies()
+        for path in in_store:
+            trash(path, str(path.relative_to(STORE)), "conflicts", "conflicts")
+        if in_store:
+            published, note = git_roll(
+                state, roll_message(state, subject=f"configsync conflicts {action}"))
+            if not published:
+                print(f"conflicts: git: {note}", file=sys.stderr)
+        total = retired + len(in_store)
+        print(f"conflicts: {total} cop(ies) retired to the trash, "
+              f"{keep} kept per file")
+    return 0
+
+
+def local_conflict_copies(state) -> list[Path]:
+    """Every conflict copy sitting in a synced local tree."""
+    found: list[Path] = []
+    seen: set[str] = set()
+    for pair in app_pairs(state, include_disabled=True):
+        base, _, is_dir = pair_bases(pair["local"], pair["backend"])
+        if not is_dir:
+            found += conflict_copies_of(pair["local"].parent, pair["local"].name)
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git")]
+            for name in filenames:
+                if ".conflict-" in name:
+                    path = Path(dirpath) / name
+                    if str(path) not in seen:
+                        seen.add(str(path))
+                        found.append(path)
+    return sorted(found)
+
+
+CONFLICT_RE = re.compile(
+    r"^(?P<stem>.+?)\.conflict-(?P<rest>.*?)(?P<stamp>\d{8}-\d{6})(?P<suffix>\.[^.]*)?$")
+
+
+def original_of(path: Path) -> Path:
+    """The file a conflict copy was made from: same directory, original name.
+
+    `name` carries the winner's stem, then `.conflict-<host>-<stamp>`, then the
+    winner's suffix — so `config` gives `config.conflict-host-stamp` (no suffix)
+    and `config.json` gives `config.conflict-host-stamp.json`. Only the stamp
+    tells the two apart, hence the pattern rather than `Path.suffix`.
+    """
+    match = CONFLICT_RE.match(path.name)
+    if not match:
+        return path
+    return path.with_name(match.group("stem") + (match.group("suffix") or ""))
+
+
+def prune_conflict_copies(copies: list[Path], keep: int) -> int:
+    """Keep the newest `keep` copies per original, trash the rest."""
+    groups: dict[Path, list[Path]] = {}
+    for path in copies:
+        groups.setdefault(original_of(path), []).append(path)
+    retired = 0
+    for original, group in groups.items():
+        group.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in group[keep:]:
+            trash(path, to_tilde(path).removeprefix("~/"), "conflicts", "conflicts")
+            retired += 1
+    return retired
+
+
+def prune_first_sync_dirs(keep: int) -> int:
+    """First-sync copies are one-shot records; keep the newest `keep` batches."""
+    batches = sorted((p for p in CONFLICTS_DIR.glob("first-sync-*") if p.is_dir()),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    retired = 0
+    for directory in batches[keep:]:
+        retired += sum(1 for path in directory.rglob("*") if path.is_file()) or 1
+        trash(directory, directory.name, "conflicts", "conflicts")
+    return retired
+
+
+def store_conflict_copies() -> list[Path]:
+    """Conflict copies an older version already committed to the git store."""
+    if not STORE.is_dir():
+        return []
+    found = []
+    for dirpath, dirnames, filenames in os.walk(STORE):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            if ".conflict-" in name:
+                found.append(Path(dirpath) / name)
+    return sorted(found)
+
+
 def cmd_download(args):
     """Fetch the git backend into the store without touching $HOME."""
     with OperationLock():
@@ -2810,6 +3000,14 @@ def main(argv=None):
                    nargs="?", default="list")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_trash)
+
+    p = sub.add_parser("conflicts",
+                       help="list the local conflict copies, or prune the old ones")
+    p.add_argument("action", choices=["list", "prune", "empty"],
+                   nargs="?", default="list")
+    p.add_argument("--keep", type=int, default=1,
+                   help="copies to keep per file (default: 1, the newest)")
+    p.set_defaults(func=cmd_conflicts)
 
     p = sub.add_parser("download", help="fetch the git backend into the local store")
     p.set_defaults(func=cmd_download)

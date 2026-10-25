@@ -71,9 +71,11 @@ A clock that is off by a few minutes — normal between machines — decides whi
 of the two edits survives.
 
 **Now:** a baseline of fingerprints per pair makes "changed here" and "changed
-there" distinguishable. If both changed, the local copy stays in place, the
-other version is written next to it as `name.conflict-<host>-<date>` and pushed,
-so both machines end up holding both versions.
+there" distinguishable. If both changed, the local copy stays in place and the
+other version is written next to it as `name.conflict-<host>-<date>`. That copy
+is a local recovery artefact and is never synced: publishing it made every
+conflict a new file — and often a new conflict — on the other machine. It stays
+until `configsync conflicts prune` retires it to the trash.
 
 ### 2.3 A fresh machine could not restore itself — High (flow), no data loss
 
@@ -252,6 +254,7 @@ both), and only the emptied directories are pruned.
 python3 -m unittest discover -s tests -v     # 23 end-to-end tests
 configsync sync --dry-run                    # what would move, changes nothing
 configsync status                            # last result, notes, conflict paths
+configsync conflicts list                    # conflict copies kept on this machine
 configsync trash list                        # what a sync removed, if anything
 ```
 

@@ -168,7 +168,7 @@ a **baseline** recorded after the last successful pass. That is what makes
 |-------|---------|--------|
 | changed | untouched | pushed |
 | untouched | changed | pulled |
-| changed | changed | **both kept**: your copy stays in place, the backend's version is written next to it as `name.conflict-<host>-<date>` and pushed, so the other machine can see what it lost |
+| changed | changed | **both kept**: your copy stays in place, the backend's version is written next to it as `name.conflict-<host>-<date>` |
 | removed | untouched | removed from the backend too — into the trash, not unlinked |
 | removed | changed | **not** propagated; the backend's version stays |
 | new | — | pushed |
@@ -303,6 +303,7 @@ configsync service status|install|uninstall
 configsync add <path> [--name N] [--target git|gdrive]
 configsync remove <id>                 # delete a custom path, or hide a detected one
 configsync trash list|restore|restore-all|empty
+configsync conflicts list|prune|empty [--keep N]   # local conflict copies
 configsync capture-software            # record plugins + packages into the manifest
 configsync install-software [--plan|--yes]
 configsync repos                       # list git repositories on the machine
@@ -353,7 +354,7 @@ under a second. **Refresh** rescans; it also runs when the tab is opened.
 | `~/.local/share/omarchy-configsync/git/` | The git backend working tree |
 | `~/.local/share/omarchy-configsync/baseline/` | Per-pair fingerprints from the last pass |
 | `~/.local/share/omarchy-configsync/trash/` | Files a sync removed, with an index |
-| `~/.local/share/omarchy-configsync/conflicts/` | Local copies a first sync kept aside |
+| `~/.local/share/omarchy-configsync/conflicts/` | First-sync batches kept aside (never synced) |
 
 ## Tests
 

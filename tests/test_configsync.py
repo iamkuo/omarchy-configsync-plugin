@@ -216,6 +216,9 @@ class ConfigSyncTest(unittest.TestCase):
         out = machine.run("trash", "list", "--limit", "50")
         return [line for line in out.splitlines() if '"rel"' in line]
 
+    def conflict_copies(self, machine: Machine, rel=".config/ghostty") -> list[Path]:
+        return sorted((machine.home / rel).glob("*.conflict-*"))
+
     # -- tests -------------------------------------------------------------
     def test_first_sync_captures_local_state(self):
         a = self.machine("a")
@@ -306,9 +309,125 @@ class ConfigSyncTest(unittest.TestCase):
         self.assertEqual(len(copies), 1)
         self.assertEqual(copies[0].read_text(), "from a\n",
                          "the other machine's version is kept")
-        # and the losing version is pushed, so machine A sees it too
+        # The copy is a local recovery artefact: it must not travel, or every
+        # conflict becomes a new file on the other machine as well.
         a.run("sync")
-        self.assertTrue(list((a.home / ".config/ghostty").glob("config.conflict-*")))
+        self.assertEqual(list((a.home / ".config/ghostty").glob("config.conflict-*")), [],
+                         "a conflict copy is never pushed to the other machine")
+        self.assertEqual(list(a.store(".config/ghostty").glob("config.conflict-*")), [],
+                         "a conflict copy never reaches the store")
+
+    def test_a_file_rewritten_on_one_machine_never_conflicts(self):
+        # A daemon that rewrites its own config (rclone, fcitx5, this tool's own
+        # state save) used to conflict on every pass: the watcher's fast copy
+        # landed in the backend, then the file changed again, so the pass read
+        # its own earlier copy as a change from another machine and kept a
+        # "conflicting" version of it. One machine, many passes, no conflict.
+        a = self.machine("a")
+        a.write(GHOSTTY, "v0\n")
+        self.configure(a)
+        a.run("sync")
+        a.run("watch", "--on")
+        for i in range(4):
+            a.write(GHOSTTY, f"v{i + 1}\n")
+            time.sleep(0.2)
+            a.write(GHOSTTY, f"v{i + 1} again\n")
+            a.run("sync")
+        copies = list((a.home / ".config/ghostty").glob("config.conflict-*"))
+        self.assertEqual(copies, [], "one machine's own rewrites are not a conflict")
+        self.assertEqual(self.store_show(GHOSTTY), "v4 again\n")
+
+    def test_a_conflict_copy_in_the_tree_is_never_synced(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "live\n")
+        a.write(".config/ghostty/config.conflict-omarchy-20260101-000000", "old\n")
+        self.configure(a)
+        a.run("sync")
+        self.assertEqual(self.store_show(".config/ghostty/config.conflict-omarchy-"
+                                        "20260101-000000"), "",
+                         "an existing conflict copy must not be published")
+        self.assertEqual(a.store(GHOSTTY).read_text(), "live\n")
+
+    def test_own_state_and_its_backup_never_travel(self):
+        a = self.machine("a")
+        a.write(".config/omarchy/configsync.json", '{"version": 3}\n')
+        a.write(".config/omarchy/configsync.json.bak", '{"version": 2}\n')
+        a.write(".config/omarchy/shell.json", "{}\n")
+        self.configure(a)
+        a.run("sync")
+        self.assertFalse(a.store(".config/omarchy/configsync.json").exists())
+        self.assertFalse(a.store(".config/omarchy/configsync.json.bak").exists(),
+                         "the backup of our own state is just as local as the state")
+        self.assertTrue(a.store(".config/omarchy/shell.json").exists())
+
+    def test_generated_state_is_not_synced(self):
+        # These are written by their app between passes, so syncing them can
+        # only produce a conflict copy per pass.
+        a = self.machine("a")
+        a.write(".config/ibus/bus/916cc7b3-unix-0", "session\n")
+        a.write(".config/ibus/config", "real config\n")
+        a.write(".config/fcitx5/conf/cached_layouts", "cache\n")
+        a.write(".config/fcitx5/profile", "real profile\n")
+        a.write(".config/herdr/session.json", '{"tabs":[]}\n')
+        a.write(".config/herdr/config.toml", "real config\n")
+        self.configure(a)
+        a.run("sync")
+        self.assertFalse(a.store(".config/ibus/bus/916cc7b3-unix-0").exists())
+        self.assertFalse(a.store(".config/fcitx5/conf/cached_layouts").exists())
+        self.assertFalse(a.store(".config/herdr/session.json").exists())
+        self.assertTrue(a.store(".config/ibus/config").exists())
+        self.assertTrue(a.store(".config/fcitx5/profile").exists())
+        self.assertTrue(a.store(".config/herdr/config.toml").exists())
+
+    def test_conflicts_prune_keeps_the_newest_and_publishes(self):
+        a = self.machine("a")
+        a.write(GHOSTTY, "live\n")
+        self.configure(a)
+        a.run("sync")
+        for stamp_text, body in (("20260101-000000", "oldest\n"),
+                                 ("20260102-000000", "middle\n"),
+                                 ("20260103-000000", "newest\n")):
+            a.write(f".config/ghostty/config.conflict-omarchy-{stamp_text}", body)
+        a.run("sync")                     # the copies are excluded, so they stay put
+        self.assertEqual(len(self.conflict_copies(a)), 3)
+
+        out = a.run("conflicts", "prune", "--keep", "1")
+        self.assertIn("2", out)
+        self.assertEqual([p.name for p in self.conflict_copies(a)],
+                         ["config.conflict-omarchy-20260103-000000"],
+                         "the newest copy per file is the one kept")
+        self.assertIn("conflict", " ".join(self.trash_rels(a)),
+                      "the pruned copies are recoverable from the trash")
+
+        # A copy an older version already committed must leave the store too, or
+        # it stays on the far side forever (the scan no longer sees it).
+        stale = a.store(".config/ghostty") / "config.conflict-omarchy-20251231-000000"
+        stale.write_text("stale\n")
+        a.run("sync")                     # the pass commits what it finds in the store
+        self.assertNotEqual(self.store_show(".config/ghostty/config.conflict-omarchy-"
+                                           "20251231-000000"), "")
+        a.run("conflicts", "prune", "--keep", "1")
+        self.assertFalse(stale.exists(), "the store's copies are removed")
+        self.assertEqual(self.store_show(".config/ghostty/config.conflict-omarchy-"
+                                        "20251231-000000"), "",
+                         "and the removal is published")
+
+    def test_git_items_are_not_watched(self):
+        # The fast copy into a git store cannot reach the other machine before a
+        # pass commits it, so it buys nothing — and it hands the pass a working
+        # tree it mistakes for the other machine's content.
+        a = self.machine("a")
+        a.write(GHOSTTY, "one\n")
+        a.write("Documents/notes.txt", "hello\n")
+        self.configure(a)
+        a.run("watch", "--on")
+        view = a.state()["watch"]
+        self.assertEqual([w["source"] for w in view["watchers"]], ["~/Documents"])
+        self.assertEqual(view["expected"], 1)
+        a.write(GHOSTTY, "two\n")
+        a.run("watch", "--once")
+        self.assertEqual(self.store_show(GHOSTTY), "two\n",
+                         "the pass is what carries a git item")
 
     def test_deletion_propagates_to_trash_and_restores(self):
         a = self.machine("a")
@@ -405,6 +524,23 @@ class ConfigSyncTest(unittest.TestCase):
                         "the software manifest is meant to travel")
         self.assertFalse(a.store(".config/omarchy/configsync.json").exists(),
                          "machine-local state must stay local")
+
+    def test_the_manifest_is_not_rewritten_when_nothing_changed(self):
+        # The manifest travels, so a fresh `capturedAt` on every pass turned it
+        # into a local edit every ten minutes — and a conflict on every pass once
+        # the other machine had captured its own.
+        a = self.machine("a")
+        self.configure(a)
+        a.run("sync")
+        manifest = a.home / ".config/omarchy/configsync/software.json"
+        first = manifest.read_text()
+        stamp = manifest.stat().st_mtime_ns
+
+        out = a.run("sync")
+        self.assertEqual(manifest.read_text(), first,
+                         "an unchanged manifest is not rewritten")
+        self.assertEqual(manifest.stat().st_mtime_ns, stamp)
+        self.assertIn("up to date", out, "and the pass has nothing to send")
 
     def test_manifest_package_names_are_validated(self):
         a = self.machine("a")
@@ -661,9 +797,11 @@ class ConfigSyncTest(unittest.TestCase):
         self.assertNotIn("conflict with the remote", out,
                          "git no longer stops the pass: the reconciler decides")
         self.assertEqual(b.read(GHOSTTY), "font-size = 9\n")
-        copies = list((b.home / ".local/share/omarchy-configsync").rglob("config.conflict-*"))
+        copies = list((b.home / ".config/ghostty").glob("config.conflict-*"))
         self.assertTrue(copies, "the version that lost is kept beside it")
         self.assertEqual(copies[0].read_text(), "font-size = 16\n")
+        self.assertEqual(list((b.home / ".local/share/omarchy-configsync").rglob(
+            "config.conflict-*")), [], "and only there: the copy is never published")
         self.assertEqual(self.commit_count(b), 1)
 
     def test_state_migrates_the_old_auto_switch(self):
@@ -771,9 +909,14 @@ class ConfigSyncTest(unittest.TestCase):
 
         view = a.state()["watch"]
         self.assertEqual(view["watching"], view["expected"])
-        self.assertEqual(view["expected"], 2, "one watcher per enabled path")
-        self.assertTrue(all(w["mine"] for w in view["watchers"]))
-        self.assertIn("~/Documents", [w["source"] for w in view["watchers"]])
+        self.assertEqual(view["expected"], 1,
+                         "only a gdrive path gets a fast-copy watcher")
+        # `watch_view` lists every rsw watcher on the machine, so a machine that
+        # is really running this plugin (the live session, the timer restarting
+        # its watchers) shows up here as someone else's. Only ours is ours.
+        ours = [w for w in view["watchers"] if w["source"] == "~/Documents"]
+        self.assertTrue(ours, view)
+        self.assertTrue(all(w["mine"] for w in ours), view)
 
     def test_watch_is_idempotent_and_stops_only_ours(self):
         a = self.machine("a")
@@ -806,38 +949,23 @@ class ConfigSyncTest(unittest.TestCase):
         # loop with this plugin's filters, so a cache or a secret that the scan
         # refuses to carry cannot ride along on the fast path either.
         a = self.machine("a")
-        a.write(".config/ghostty/config", "font-size = 14\n")
-        a.write(".config/ghostty/Cache/blob", "junk\n")
-        a.write(".config/ghostty/credentials", "token\n")
-        a.write(".config/ghostty/id_rsa", "key\n")
+        a.write("Documents/notes.txt", "start\n")
+        a.write("Documents/Cache/blob", "junk\n")
+        a.write("Documents/credentials", "token\n")
+        a.write("Documents/id_rsa", "key\n")
         self.configure(a)
         a.run("watch", "--on")
         a.run("sync")
-        wait_for_watch(a.home / ".config" / "ghostty")
-        a.write(".config/ghostty/new.conf", "fresh\n")
+        wait_for_watch(a.home / "Documents")
+        a.write("Documents/new.txt", "fresh\n")
 
         def copied(rel):
-            return (a.store(".config/ghostty") / rel).exists()
+            return (self.drive / "Documents" / rel).exists()
 
-        wait_for(lambda: copied("new.conf"),
+        wait_for(lambda: copied("new.txt"),
                  "the watcher copies an ordinary new file")
         for rel in ("Cache/blob", "credentials", "id_rsa"):
             self.assertFalse(copied(rel), f"{rel} must not reach the backend")
-
-    def test_a_watcher_push_is_committed_by_the_next_pass(self):
-        # The watcher copies into the store; the pass is what commits and pushes
-        # it, so a change made here reaches the other machine from either half.
-        a = self.machine("a")
-        a.write(GHOSTTY, "one\n")
-        self.configure(a)
-        a.run("watch", "--on")
-        a.run("sync")
-        wait_for_watch(a.home / ".config" / "ghostty")
-        a.write(GHOSTTY, "two and longer\n")
-        wait_for(lambda: a.store(GHOSTTY).read_text() == "two and longer\n",
-                 "the watcher copies a local edit into the store")
-        a.run("watch", "--once")
-        self.assertEqual(self.store_show(GHOSTTY), "two and longer\n")
 
     def test_the_pass_catches_what_the_fast_path_can_miss(self):
         # rsw's rsync skips a file whose size and whole-second mtime are
@@ -845,16 +973,16 @@ class ConfigSyncTest(unittest.TestCase):
         # travel on the fast path. The pass compares nanoseconds and content, so
         # it does — that is the division of labour, and it is worth pinning down.
         a = self.machine("a")
-        a.write(GHOSTTY, "one\n")
+        a.write("Documents/notes.txt", "one\n")
         self.configure(a)
         a.run("watch", "--on")
         a.run("sync")
-        wait_for_watch(a.home / ".config" / "ghostty")
-        a.write(GHOSTTY, "two\n")          # same size, same second
+        wait_for_watch(a.home / "Documents")
+        a.write("Documents/notes.txt", "two\n")          # same size, same second
         time.sleep(2)
         out = a.run("watch", "--once")
-        self.assertEqual(a.read(GHOSTTY), "two\n")
-        self.assertEqual(self.store_show(GHOSTTY), "two\n",
+        self.assertEqual(a.read("Documents/notes.txt"), "two\n")
+        self.assertEqual((self.drive / "Documents" / "notes.txt").read_text(), "two\n",
                          f"the pass should carry it: {out}")
 
 

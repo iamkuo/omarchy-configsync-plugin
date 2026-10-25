@@ -48,7 +48,7 @@ flowchart TD
     Q["Scan the backend side, same filters"]
     R["Load the baseline recorded last pass"]
     S["make_plan: local vs backend vs baseline"]
-    T["Apply: rsync copies, conflict copies,<br/>removals moved to the trash"]
+    T["Apply: rsync copies, conflict copy kept<br/>locally, removals moved to the trash"]
     U["git pairs: add, commit, push"]
     V["Save the new baseline, counts, last run"]
     N --> O --> P --> Q --> R --> S --> T --> U --> V
@@ -267,7 +267,7 @@ flowchart TD
 | identical | anything | nothing |
 | differ | only local changed | local wins, copied to the backend |
 | differ | only the backend changed | the backend wins, copied to the local side |
-| differ | both changed, differently | **both are kept**: the winner lands in place, the loser is copied beside it as `<name>.conflict-<machine>-<stamp><ext>` |
+| differ | both changed, differently | **both are kept**: the winner lands in place, the loser is copied beside it as `<name>.conflict-<machine>-<stamp><ext>` — a local artefact that is never published; `configsync conflicts prune` retires the old ones to the trash |
 | one side missing | the missing side was never there | the file is new, copied to the side that lacks it |
 | one side missing | that side is where the baseline had it | a removal: the surviving copy moves to the trash, so it can be restored |
 | one side missing | both sides changed | treated as a conflict, not as a removal |
@@ -353,6 +353,7 @@ configsync watch --status                      # JSON: watchers, timer, last pas
 configsync service status|install|uninstall    # the timer units
 
 configsync trash list|restore|restore-all|empty [--limit N]
+configsync conflicts list|prune|empty [--keep N]  # local copies, never synced
 ```
 
 `lsw` and `dsw` from Omarchy's shell functions work on the plugin's watchers as
