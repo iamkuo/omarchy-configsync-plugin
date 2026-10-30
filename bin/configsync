@@ -2085,6 +2085,13 @@ Type=oneshot
 # are alive and then does the slow pass (pulls, deletions, git commits).
 ExecStartPre="{sys.executable}" "{quoted}" watch --ensure
 ExecStart="{sys.executable}" "{quoted}" watch --once
+# The watchers ExecStartPre starts are detached (setsid), but they are still in
+# this unit's cgroup. With the default KillMode=control-group, systemd kills
+# every process left in the cgroup once this oneshot exits — so the watchers
+# started at login died seconds later, and the next pass simply started them
+# again only to kill them again. Kill only the unit's own process instead; the
+# plugin stops its watchers itself (`watch --off`, `watch --stop`).
+KillMode=process
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=900
